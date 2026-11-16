@@ -14,6 +14,9 @@ export class QuickSearchModal extends Modal {
   private statusEl!: HTMLElement;
   private items: SearchItem[] = [];
   private selectedIdx = 0;
+  private lastSearchedQuery = '';
+  private lastSearchedProject = '';
+  private lastSearchedSource = 'all';
 
   constructor(
     app: App,
@@ -51,6 +54,7 @@ export class QuickSearchModal extends Modal {
     const searchBtn = controls.createEl('button', { text: 'Search', cls: 'mod-cta' });
     this.statusEl = contentEl.createDiv({ cls: 'mindloom-muted' });
     this.statusEl.style.marginTop = '6px';
+    this.statusEl.setText('Enter to search · ↑↓ to select · Enter again (or Ctrl+Enter) to open · Shift+Enter to jump ^event');
     this.resultsEl = contentEl.createDiv();
     this.resultsEl.style.marginTop = '8px';
     this.resultsEl.style.maxHeight = '380px';
@@ -72,26 +76,37 @@ export class QuickSearchModal extends Modal {
         this.resultsEl.empty();
         return;
       }
+      this.lastSearchedQuery = q;
+      this.lastSearchedProject = proj;
+      this.lastSearchedSource = src;
       this.items = res.data.items || [];
       this.selectedIdx = 0;
       this.statusEl.setText(
         res.data.noAnswer
           ? 'No sanitized matches found (Mode 0 literal).'
-          : `Found ${this.items.length} result(s) · Mode: ${res.data.mode}`
+          : `Found ${this.items.length} result(s) · Mode: ${res.data.mode} · Enter to open selected`
       );
       this.renderResults();
+    };
+
+    const openSelected = (preferAnchor: boolean) => {
+      const item = this.items[this.selectedIdx];
+      if (!item) return;
+      const anchors = extractEventWikilinks([...(item.event_anchors || []), ...(item.sources || [])]);
+      this.close();
+      void this.openTarget(item.path, preferAnchor && anchors.length > 0 ? anchors[0] : undefined);
     };
 
     searchBtn.addEventListener('click', () => void runSearch());
     this.inputEl.addEventListener('keydown', (ev: KeyboardEvent) => {
       if (ev.key === 'Enter') {
         ev.preventDefault();
-        if (this.items.length > 0 && ev.ctrlKey) {
-          const item = this.items[this.selectedIdx];
-          if (item) {
-            this.close();
-            void this.openTarget(item.path);
-          }
+        const sameQuery =
+          this.inputEl.value.trim() === this.lastSearchedQuery &&
+          this.projectInputEl.value.trim() === this.lastSearchedProject &&
+          this.sourceSelectEl.value === this.lastSearchedSource;
+        if (this.items.length > 0 && (ev.ctrlKey || ev.shiftKey || sameQuery)) {
+          openSelected(ev.shiftKey);
         } else {
           void runSearch();
         }
@@ -149,7 +164,7 @@ export class QuickSearchModal extends Modal {
         row.createDiv({ cls: 'mindloom-muted', text: item.snippet });
       }
 
-      const anchors = extractEventWikilinks(item.sources || []);
+      const anchors = extractEventWikilinks([...(item.event_anchors || []), ...(item.sources || [])]);
       if (anchors.length > 0 || (item.sources && item.sources.length > 0)) {
         const srcRow = row.createDiv({ cls: 'mindloom-actions' });
         srcRow.style.marginTop = '4px';

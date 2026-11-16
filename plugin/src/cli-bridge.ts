@@ -229,15 +229,33 @@ export class CliBridge {
   readLastAutoSyncTime(): string | null {
     const { dataPath } = this.resolvePaths();
     if (!dataPath) return null;
+    const candidates: number[] = [];
+
+    const latestJsonPath = path.join(dataPath, 'runtime', 'logs', 'auto-sync-latest.json');
+    if (fs.existsSync(latestJsonPath)) {
+      try {
+        const latest = JSON.parse(fs.readFileSync(latestJsonPath, 'utf8')) as { executedAt?: string };
+        const ts = latest.executedAt ? Date.parse(latest.executedAt) : NaN;
+        if (Number.isFinite(ts)) candidates.push(ts);
+      } catch {
+        // ignore invalid json
+      }
+    }
+
     const logPath = path.join(dataPath, 'runtime', 'logs', 'auto-sync-runner.log');
     if (fs.existsSync(logPath)) {
       try {
         const st = fs.statSync(logPath);
-        return st.mtime.toISOString();
+        if (Number.isFinite(st.mtimeMs)) candidates.push(st.mtimeMs);
       } catch {
-        return null;
+        // ignore stat error
       }
     }
+
+    if (candidates.length > 0) {
+      return new Date(Math.max(...candidates)).toISOString();
+    }
+
     const cfgPath = path.join(dataPath, 'manifests', 'auto-sync-config.json');
     if (fs.existsSync(cfgPath)) {
       try {

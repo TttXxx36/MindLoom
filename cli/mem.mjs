@@ -12,7 +12,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { initRepository, DEFAULT_VAULT_PATH, DEFAULT_DATA_PATH } from '../src/init.mjs';
 const DEFAULT_REPO_ROOT_HINT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-import { resolveConfiguredPaths } from '../src/config/paths.mjs';
+import { resolveConfiguredPaths, readInstallConfig } from '../src/config/paths.mjs';
 import { runSetupWizard } from '../src/setup/wizard.mjs';
 import { DEFAULT_PRICING_CATALOG } from '../src/security/cloud-approvals.mjs';
 import { DEFAULT_OPERATOR_ROOT, buildOperatorIsolationTargets } from '../src/security/isolation-sentinel.mjs';
@@ -103,10 +103,22 @@ function detectReparsePoints(pathsToCheck) {
     try {
       const escaped = existing.map(p => `'${p.replace(/'/g, "''")}'`).join(',');
       const psCmd = `@(${escaped}) | ForEach-Object { $it = Get-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue; if ($it -and ($it.Attributes -band [IO.FileAttributes]::ReparsePoint)) { $it.FullName } }`;
-      const out = execFileSync('pwsh', ['-NoProfile', '-NonInteractive', '-Command', psCmd], {
-        encoding: 'utf8',
-        stdio: ['pipe', 'pipe', 'pipe']
-      }).trim();
+      let out = '';
+      try {
+        out = execFileSync('pwsh', ['-NoProfile', '-NonInteractive', '-Command', psCmd], {
+          encoding: 'utf8',
+          stdio: ['pipe', 'pipe', 'pipe']
+        }).trim();
+      } catch (psErr) {
+        if (psErr?.code === 'ENOENT') {
+          out = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', psCmd], {
+            encoding: 'utf8',
+            stdio: ['pipe', 'pipe', 'pipe']
+          }).trim();
+        } else {
+          throw psErr;
+        }
+      }
       if (out) {
         for (const line of out.split(/\r?\n/)) {
           const clean = line.trim();
@@ -1306,7 +1318,9 @@ try {
         id: matchedProp.frontmatter.id,
         title: matchedProp.frontmatter.title,
         privacy: matchedProp.frontmatter.privacy,
+        path: matchedProp.path,
         target_id: matchedProp.frontmatter.target_id,
+        target_path: targetIsSanitized ? targetRow.path : null,
         base_revision_id: matchedProp.frontmatter.base_revision_id,
         proposal_kind: matchedProp.frontmatter.proposal_kind,
         proposal_status: matchedProp.frontmatter.proposal_status,
@@ -1808,9 +1822,11 @@ try {
           const items = rows.map(r => {
             const safe = isVaultNoteSanitizedForExitB(db, r.path, r.id);
             const noteRevDir = path.join(revRoot, r.id);
-            const revFiles = fs.existsSync(noteRevDir)
+            const allRevFiles = fs.existsSync(noteRevDir)
               ? fs.readdirSync(noteRevDir).filter(f => f.endsWith('.md')).map(f => f.replace(/\.md$/, ''))
               : [];
+            const numberedRevs = allRevFiles.filter(name => /^rev-\d+$/i.test(name)).sort();
+            const revFiles = numberedRevs.length > 0 ? numberedRevs : allRevFiles;
             return {
               id: r.id,
               note_type: r.note_type,
@@ -2300,6 +2316,9 @@ try {
       const norm = (p) => path.resolve(p).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
       const homeNorm = norm(os.homedir());
       for (const p of [...newPaths, ...newGitRoots]) {
+        if (!path.isAbsolute(p)) {
+          throw new Error(`PROJECT_MAP_RELATIVE_PATH_FORBIDDEN: 必须使用绝对路径 (${p})，禁止相对路径以免在不同工作目录下歧义匹配`);
+        }
         const np = norm(p);
         const rootNorm = norm(path.parse(path.resolve(p)).root);
         if (!np || np === rootNorm || np === homeNorm) {
@@ -2418,6 +2437,18 @@ try {
       }
     }
 
+    const dataInstallCfgPath = path.join(effDataPath, 'manifests', 'install-config.json');
+    const dataInstallCfg = readInstallConfig(dataInstallCfgPath);
+    const userInstallCfg = readInstallConfig();
+    const repoRootCandidates = [
+      DEFAULT_REPO_ROOT_HINT,
+      dataInstallCfg.repoRoot,
+      userInstallCfg.repoRoot
+    ].filter(Boolean);
+    const effectiveRepoRoot =
+      repoRootCandidates.find((r) => fs.existsSync(path.join(r, 'scripts', 'setup-operator-isolation.ps1'))) ||
+      DEFAULT_REPO_ROOT_HINT;
+    const setupIsolationScript = path.join(effectiveRepoRoot, 'scripts', 'setup-operator-isolation.ps1');
     const operatorEntry = path.join(targets.cliRoot, 'cli', 'mem-operator.mjs');
     const report = {
       readOnly: true,
@@ -2429,7 +2460,7 @@ try {
       egressPackages,
       pricingCatalog: DEFAULT_PRICING_CATALOG,
       adminCommands: {
-        setupIsolation: `pwsh -File "${path.join(DEFAULT_REPO_ROOT_HINT, 'scripts', 'setup-operator-isolation.ps1')}" -OperatorRoot "${opRoot}"`,
+        setupIsolation: `pwsh -File "${setupIsolationScript}" -OperatorRoot "${opRoot}"`,
         issueCloudApproval: `pwsh -File "${path.join(targets.cliRoot, 'scripts', 'approve-human.ps1')}" -OperatorRoot "${opRoot}"`,
         listApprovals: `node "${operatorEntry}" list-approvals --operator-root "${opRoot}"`,
         runDistill: `node "${operatorEntry}" distill --session "<SES-ID>" --approval "<CEGR-...>" --vault "${values.vault || vaultPath}" --data "${effDataPath}"`

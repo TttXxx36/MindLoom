@@ -114,6 +114,14 @@ export class MindLoomConsoleView extends ItemView {
         if (res.ok && res.data) {
           const p = res.data.proposals;
           new Notice(`Reconcile complete: checked=${p?.checked ?? 0}, verified=${p?.applied ?? 0}`);
+          if (this.selectedProposal) {
+            const refreshed = await this.plugin.bridge.runJson<ProposalShowResponse>([
+              'proposal',
+              'show',
+              this.selectedProposal.id
+            ]);
+            this.selectedProposal = refreshed.ok && refreshed.data ? refreshed.data : null;
+          }
           await this.plugin.refreshStatusBar();
           await this.render();
         } else {
@@ -164,12 +172,39 @@ export class MindLoomConsoleView extends ItemView {
       });
 
       if (prop.condition_checks) {
-        const condBadge = detailCard.createDiv();
-        condBadge.style.marginTop = '6px';
-        condBadge.createSpan({
+        const condWrap = detailCard.createDiv();
+        condWrap.style.marginTop = '6px';
+        condWrap.createSpan({
           cls: `mindloom-badge ${prop.condition_checks.passed ? 'mindloom-badge-ok' : 'mindloom-badge-warn'}`,
           text: prop.condition_checks.passed ? 'Pre/Post Conditions Satisfied' : 'Conditions Pending'
         });
+        for (const preCond of prop.condition_checks.pre_conditions || []) {
+          const ok = Boolean(preCond.passed ?? preCond.satisfied);
+          condWrap.createDiv({
+            cls: 'mindloom-muted',
+            text: `${ok ? '✔' : '✖'} [pre] ${preCond.text || ''}`
+          });
+        }
+        for (const postCond of prop.condition_checks.post_conditions || []) {
+          const ok = Boolean(postCond.passed ?? postCond.satisfied);
+          condWrap.createDiv({
+            cls: 'mindloom-muted',
+            text: `${ok ? '✔' : '✖'} [post] ${postCond.text || ''}`
+          });
+        }
+      }
+
+      if (prop.path || prop.target_path) {
+        const linkRow = detailCard.createDiv({ cls: 'mindloom-actions' });
+        linkRow.style.marginTop = '6px';
+        if (prop.path && prop.path !== '[REDACTED_LOCAL_ONLY]') {
+          const openPropBtn = linkRow.createEl('button', { text: 'Open Proposal Note' });
+          openPropBtn.addEventListener('click', () => void this.plugin.openVaultFile(prop.path!));
+        }
+        if (prop.target_path && prop.target_path !== '[REDACTED_LOCAL_ONLY]') {
+          const openTargetBtn = linkRow.createEl('button', { text: 'Open Target Note' });
+          openTargetBtn.addEventListener('click', () => void this.plugin.openVaultFile(prop.target_path!));
+        }
       }
 
       if (prop.base_revision_diff) {
@@ -180,10 +215,18 @@ export class MindLoomConsoleView extends ItemView {
         } else if (!d.base_revision_found) {
           pre.setText(`Base revision not found (${d.reason || 'missing'})`);
         } else {
-          const lines: string[] = [];
-          for (const rem of d.removed_lines || []) lines.push(`- ${rem}`);
-          for (const add of d.added_lines || []) lines.push(`+ ${add}`);
-          pre.setText(lines.length > 0 ? lines.join('\n') : '(No diff vs base revision)');
+          const removed = d.removed_lines || [];
+          const added = d.added_lines || [];
+          if (removed.length === 0 && added.length === 0) {
+            pre.setText('(No diff vs base revision)');
+          } else {
+            for (const rem of removed) {
+              pre.createEl('div', { text: `- ${rem}`, cls: 'mindloom-diff-del' });
+            }
+            for (const add of added) {
+              pre.createEl('div', { text: `+ ${add}`, cls: 'mindloom-diff-add' });
+            }
+          }
         }
       }
 

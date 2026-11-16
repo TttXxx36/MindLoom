@@ -113,11 +113,20 @@ export default class MindLoomPlugin extends Plugin {
   }
 
   async openHomeNote(): Promise<void> {
+    if (!this.app.vault.getAbstractFileByPath('首页.md')) {
+      new Notice('首页.md not found in Vault. Run "mem setup" or "Sync & Rebuild MOC" first.');
+      return;
+    }
     await this.app.workspace.openLinkText('首页.md', '', false);
   }
 
   async openDigestBrief(): Promise<void> {
-    await this.app.workspace.openLinkText('00_MOC/学习简报_最新会话精华.md', '', false);
+    const briefPath = '00_MOC/学习简报_最新会话精华.md';
+    if (!this.app.vault.getAbstractFileByPath(briefPath)) {
+      new Notice('Digest brief not generated yet. Click "Sync & Rebuild MOC" first.');
+      return;
+    }
+    await this.app.workspace.openLinkText(briefPath, '', false);
   }
 
   async openVaultFile(absOrRelPath: string, anchorTarget?: string): Promise<void> {

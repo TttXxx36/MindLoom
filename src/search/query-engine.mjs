@@ -96,12 +96,31 @@ function buildSourceToolDerivationIndex(vaultDir, db = null) {
     if (fmId) map.set(fmId, value);
   };
 
+  const sessionSanitizedByKey = new Map();
+  const sessionAllByKey = new Map();
+  const evidenceSanitizedSourcesByKey = new Map();
+
+  const isDbNoteSanitizedActive = (fmId) => {
+    if (!db || !fmId) return true;
+    try {
+      const r = db.prepare('SELECT status, privacy FROM notes WHERE id = ?').get(fmId);
+      if (!r) return true;
+      return r.status !== 'missing' && r.status !== 'deleted' && (!r.privacy || r.privacy === 'sanitized');
+    } catch {
+      return false;
+    }
+  };
+
   const sessionsDir = path.join(vaultDir, '10_Readable_Sessions');
   for (const fp of findMarkdownFiles(sessionsDir, { excludeTemplates: true, followSymlinks: false, boundaryDir: vaultDir })) {
     try {
       const { frontmatter } = parseFrontmatter(fs.readFileSync(fp, 'utf8'));
+      registerKeys(sessionAllByKey, fp, frontmatter.id, true);
       if (frontmatter.source_tool) {
         registerKeys(sessionToolByKey, fp, frontmatter.id, String(frontmatter.source_tool).toLowerCase());
+      }
+      if (frontmatter.privacy === 'sanitized' && isDbNoteSanitizedActive(frontmatter.id)) {
+        registerKeys(sessionSanitizedByKey, fp, frontmatter.id, true);
       }
     } catch {
       // ignore
@@ -131,6 +150,9 @@ function buildSourceToolDerivationIndex(vaultDir, db = null) {
     try {
       const { frontmatter } = parseFrontmatter(fs.readFileSync(fp, 'utf8'));
       registerKeys(evidenceSourcesByKey, fp, frontmatter.id, frontmatter.sources || []);
+      if (frontmatter.privacy === 'sanitized' && isDbNoteSanitizedActive(frontmatter.id)) {
+        registerKeys(evidenceSanitizedSourcesByKey, fp, frontmatter.id, frontmatter.sources || []);
+      }
       if (frontmatter.source_tool) {
         registerKeys(evidenceDirectToolByKey, fp, frontmatter.id, String(frontmatter.source_tool).toLowerCase());
       }
@@ -148,7 +170,16 @@ function buildSourceToolDerivationIndex(vaultDir, db = null) {
     return [clean, base, noExt, ...(prefixMatch ? [prefixMatch[1]] : [])];
   }
 
-  return function deriveForNote(frontmatter) {
+  function formatCleanAnchorLink(rawLink) {
+    const clean = String(rawLink || '').replace(/^\[\[/, '').replace(/\]\]$/, '').split('|')[0].trim();
+    if (!/#\^event-\d+/i.test(clean)) return null;
+    const targetTokens = extractTargetTokensFromWikiLink(clean);
+    const knownSession = targetTokens.some(tok => sessionSanitizedByKey.has(tok));
+    if (sessionAllByKey.size > 0 && !knownSession) return null;
+    return sanitizeOutputText(clean);
+  }
+
+  const deriveForNote = function deriveForNote(frontmatter) {
     const tools = new Set();
     if (frontmatter.source_tool) {
       tools.add(String(frontmatter.source_tool).toLowerCase());
@@ -181,6 +212,26 @@ function buildSourceToolDerivationIndex(vaultDir, db = null) {
 
     return [...tools];
   };
+
+  deriveForNote.deriveEventAnchors = function deriveEventAnchors(frontmatter) {
+    const anchors = new Set();
+    for (const srcLink of frontmatter.sources || []) {
+      const directAnchor = formatCleanAnchorLink(srcLink);
+      if (directAnchor) anchors.add(directAnchor);
+      const tokens = extractTargetTokensFromWikiLink(srcLink);
+      for (const tok of tokens) {
+        if (evidenceSanitizedSourcesByKey.has(tok)) {
+          for (const evLink of evidenceSanitizedSourcesByKey.get(tok) || []) {
+            const evAnchor = formatCleanAnchorLink(evLink);
+            if (evAnchor) anchors.add(evAnchor);
+          }
+        }
+      }
+    }
+    return [...anchors];
+  };
+
+  return deriveForNote;
 }
 
 /**
@@ -698,6 +749,7 @@ export function searchKnowledge({
       lifecycle: frontmatter.lifecycle,
       review_state: frontmatter.review_state,
       sources: (frontmatter.sources || []).map(s => sanitizeOutputText(s)),
+      event_anchors: deriveSourceToolsForNote.deriveEventAnchors(frontmatter),
       snippet: safeSnippet,
       score: Number(totalScore.toFixed(4)),
       trustBoundary: 'untrusted_memory_data',

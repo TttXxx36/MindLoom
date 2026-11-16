@@ -102,6 +102,8 @@ old_buggy_step
     );
     assert.equal(listDeleted.count, 1);
     assert.equal(listDeleted.items[0].id, knId);
+    assert.equal(listDeleted.items[0].revisions[0], 'rev-0001');
+    assert.equal(listDeleted.items[0].revisions.includes('latest'), false);
 
     const previewRes = JSON.parse(
       execFileSync(process.execPath, [CLI_PATH, 'restore', knId, '--revision', 'rev-0001', '--json'], { env, encoding: 'utf8' })
@@ -130,6 +132,15 @@ old_buggy_step
       execFileSync(
         process.execPath,
         [CLI_PATH, 'project-map', 'upsert', '--project', 'ProjB', '--paths', path.join(tmp, 'proj-a', 'sub')],
+        { env, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
+      )
+    );
+
+    // Relative paths must be rejected so plugin CWD never causes ambiguous mappings
+    assert.throws(() =>
+      execFileSync(
+        process.execPath,
+        [CLI_PATH, 'project-map', 'upsert', '--project', 'RelProj', '--paths', 'relative-only'],
         { env, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
       )
     );
@@ -223,11 +234,97 @@ old_buggy_step
     assert.equal(missRes.ok, false);
     assert.match(missRes.error, /not found/);
 
-    // diff-utils checks
-    const diff = computeSimpleLineDiff('line1\noldLine', 'line1\nnewLine');
-    assert.ok(diff.some((d) => d.kind === 'del' && d.text.includes('oldLine')));
-    assert.ok(diff.some((d) => d.kind === 'add' && d.text.includes('newLine')));
-    const links = extractEventWikilinks(['[[10_Readable_Sessions/SES-01#^event-000012]]', '[[20_Evidence_Cards/EV-01]]']);
+    // diff-utils checks (including LCS ordering, duplicate lines, and |alias stripping)
+    const diff = computeSimpleLineDiff('---\nline1\noldLine\n---\n', '---\nline1\nnewLine\n---\n');
+    assert.deepEqual(
+      diff.map((d) => d.text),
+      ['  ---', '  line1', '- oldLine', '+ newLine', '  ---', '  ']
+    );
+    const links = extractEventWikilinks([
+      '[[10_Readable_Sessions/SES-01#^event-000012|事件 #12]]',
+      '[[10_Readable_Sessions/SES-01#^event-000012]]',
+      '[[20_Evidence_Cards/EV-01]]'
+    ]);
     assert.deepEqual(links, ['10_Readable_Sessions/SES-01#^event-000012']);
+
+    // readLastAutoSyncTime reads auto-sync-latest.json
+    const logsDir = path.join(settings.dataPath, 'runtime', 'logs');
+    fs.mkdirSync(logsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(logsDir, 'auto-sync-latest.json'),
+      JSON.stringify({ executedAt: '2026-11-16T04:05:06.000Z' }),
+      'utf8'
+    );
+    assert.equal(okBridge.readLastAutoSyncTime(), '2026-11-16T04:05:06.000Z');
+  });
+
+  await t.test('4. Deployed CLI cloud-budget resolves real setupIsolation script & search resolves sanitized 1-hop event_anchors', async () => {
+    const { runSetupWizard } = await import('../src/setup/wizard.mjs');
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ml-stage3-anchors-'));
+    t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
+
+    const vaultDir = path.join(tmp, 'Vault');
+    const dataDir = path.join(tmp, 'Vault-Data');
+    await runSetupWizard({
+      vaultPath: vaultDir,
+      dataPath: dataDir,
+      configPath: path.join(tmp, 'cfg.json'),
+      yes: true,
+      skipPlugin: true,
+      sourceRoots: { codexHome: path.join(tmp, 'no-cdx'), codexArchivedDir: null, antigravityBrainDir: path.join(tmp, 'no-agy'), dshHome: path.join(tmp, 'no-dsh') }
+    });
+
+    const deployedCli = path.join(dataDir, 'cli', 'mem.mjs');
+    const budget = JSON.parse(
+      execFileSync(process.execPath, [deployedCli, 'cloud-budget', '--vault', vaultDir, '--data', dataDir, '--json'], { encoding: 'utf8' })
+    );
+    const match = budget.adminCommands.setupIsolation.match(/-File\s+"([^"]+)"/);
+    assert.ok(match && fs.existsSync(match[1]), `Expected existing setupIsolation script, got: ${budget.adminCommands.setupIsolation}`);
+
+    // Seed sanitized + local_only sessions -> evidence -> knowledge note to verify 1-hop event_anchors privacy gate
+    const db = openExistingDatabase(path.join(dataDir, 'runtime', 'state.sqlite'));
+    const sesSanId = 'SES-019316a8-8888-7000-8000-000000000001';
+    const sesSanName = 'SES-20261116-codex-000001_san.md';
+    const sesPrivId = 'SES-019316a8-8888-7000-8000-000000000002';
+    const sesPrivName = 'SES-20261116-codex-000002_priv.md';
+    const evId = 'EV-019316a8-8888-7000-8000-000000000003';
+    const evName = 'EV-20261116-000003_ev.md';
+    const knId = 'KN-019316a8-8888-7000-8000-000000000004';
+    const knPath = path.join(vaultDir, '30_Knowledge_Notes', 'Playbooks', 'KN-20261116-000004_anchor.md');
+
+    const s1 = stageCandidate({
+      stagingDir: path.join(dataDir, 'staging'),
+      outputUuid: sesSanId,
+      content: `---\nschema_version: 1\nid: "${sesSanId}"\nnote_type: "session"\ntitle: "san"\nproject: "P"\nprivacy: "sanitized"\nsource_tool: "codex"\nsession_id: "s1"\nsnapshot_id: "snap1"\ncreated_at: "2026-11-16T00:00:00Z"\n---\n\n^event-000007\n`
+    });
+    publishFile({ db, operationId: 'op-a1', outputUuid: sesSanId, stagingPath: s1.stagingPath, vaultTargetPath: path.join(vaultDir, '10_Readable_Sessions', sesSanName), contentSha256: s1.contentSha256 });
+
+    const s2 = stageCandidate({
+      stagingDir: path.join(dataDir, 'staging'),
+      outputUuid: sesPrivId,
+      content: `---\nschema_version: 1\nid: "${sesPrivId}"\nnote_type: "session"\ntitle: "priv"\nproject: "P"\nprivacy: "local_only"\nsource_tool: "codex"\nsession_id: "s2"\nsnapshot_id: "snap2"\ncreated_at: "2026-11-16T00:00:00Z"\n---\n\n^event-000009\n`
+    });
+    publishFile({ db, operationId: 'op-a2', outputUuid: sesPrivId, stagingPath: s2.stagingPath, vaultTargetPath: path.join(vaultDir, '10_Readable_Sessions', sesPrivName), contentSha256: s2.contentSha256 });
+
+    const s3 = stageCandidate({
+      stagingDir: path.join(dataDir, 'staging'),
+      outputUuid: evId,
+      content: `---\nschema_version: 1\nid: "${evId}"\nnote_type: "evidence"\ntitle: "ev"\nproject: "P"\nprivacy: "sanitized"\nsource_tool: "codex"\nevidence_level: "observed"\nsources:\n  - "[[10_Readable_Sessions/${sesSanName}#^event-000007]]"\n  - "[[10_Readable_Sessions/${sesPrivName}#^event-000009]]"\ncreated_at: "2026-11-16T00:00:00Z"\n---\n\nev\n`
+    });
+    publishFile({ db, operationId: 'op-a3', outputUuid: evId, stagingPath: s3.stagingPath, vaultTargetPath: path.join(vaultDir, '20_Evidence_Cards', evName), contentSha256: s3.contentSha256 });
+
+    const s4 = stageCandidate({
+      stagingDir: path.join(dataDir, 'staging'),
+      outputUuid: knId,
+      content: `---\nschema_version: 1\nid: "${knId}"\nnote_type: "playbook"\ntitle: "Anchor Resolution Test"\nproject: "P"\nprivacy: "sanitized"\nlifecycle: "active"\nevidence_level: "observed"\nreview_state: "accepted"\nenv:\n  os: "windows"\nsources:\n  - "[[20_Evidence_Cards/${evName}]]"\ncreated_at: "2026-11-16T00:00:00Z"\n---\n\nFix anchor401\n`
+    });
+    publishFile({ db, operationId: 'op-a4', outputUuid: knId, stagingPath: s4.stagingPath, vaultTargetPath: knPath, contentSha256: s4.contentSha256 });
+    db.close();
+
+    const searchRes = JSON.parse(
+      execFileSync(process.execPath, [deployedCli, 'search', 'anchor401', '--mode', 'literal', '--vault', vaultDir, '--data', dataDir, '--json'], { encoding: 'utf8' })
+    );
+    assert.equal(searchRes.items.length, 1);
+    assert.deepEqual(searchRes.items[0].event_anchors, [`10_Readable_Sessions/${sesSanName}#^event-000007`]);
   });
 });

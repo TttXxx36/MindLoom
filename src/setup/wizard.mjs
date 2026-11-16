@@ -143,7 +143,7 @@ function isGenericContainerPath(dirPath, homeDir = os.homedir(), { hasGit = fals
   ]);
   const base = path.basename(norm).toLowerCase();
   if (genericNames.has(base)) return true;
-  if (norm === path.join(homeNorm, '.gemini', 'antigravity').toLowerCase()) return true;
+  if (norm.toLowerCase() === path.join(homeNorm, '.gemini', 'antigravity').toLowerCase()) return true;
   return false;
 }
 
@@ -180,17 +180,58 @@ function sanitizeProjectName(rawName) {
     .join('');
 }
 
-function extractAntigravityCwdHint(filePath) {
+function extractStringsFromJsonValue(val, out = []) {
+  if (typeof val === 'string') {
+    out.push(val);
+  } else if (Array.isArray(val)) {
+    for (const item of val) extractStringsFromJsonValue(item, out);
+  } else if (val && typeof val === 'object') {
+    for (const v of Object.values(val)) extractStringsFromJsonValue(v, out);
+  }
+  return out;
+}
+
+function matchWorkingDirectoryHint(text) {
+  const m = String(text || '').match(
+    /Command Working Directory:\s*([A-Za-z]:[\\/][^\r\n<>"|*?\x00]{1,220}|\/[^\r\n<>"|*?\x00]{1,220})/i
+  );
+  return m && m[1] ? m[1].trim() : null;
+}
+
+export function extractAntigravityCwdHint(filePath) {
   if (!filePath || !fs.existsSync(filePath)) return null;
   try {
     const fd = fs.openSync(filePath, 'r');
     try {
-      const buf = Buffer.allocUnsafe(24576);
+      const buf = Buffer.allocUnsafe(65536);
       const n = fs.readSync(fd, buf, 0, buf.length, 0);
       if (n <= 0) return null;
       const head = buf.subarray(0, n).toString('utf8');
-      const m = head.match(/Command Working Directory:\s*([A-Za-z]:[\\/][^\r\n<>"|*?\x00]{1,200}|\/[^\r\n<>"|*?\x00]{1,200})/i);
-      return m && m[1] ? m[1].trim() : null;
+
+      // 1. Prefer proper JSON line parsing so escaped \\ and \n are decoded cleanly
+      for (const line of head.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) continue;
+        try {
+          const parsed = JSON.parse(trimmed);
+          const strings = extractStringsFromJsonValue(parsed);
+          for (const s of strings) {
+            const hit = matchWorkingDirectoryHint(s);
+            if (hit) return hit;
+          }
+        } catch {
+          // ignore partial/malformed JSON line
+        }
+      }
+
+      // 2. Fallback for truncated/raw text: stop before unescaped JSON \n, \r, \t, \"
+      const rawMatch = head.match(
+        /Command Working Directory:\s*([A-Za-z]:(?:\\\\|[\\/])(?:(?!(?<!\\)\\[nrt"]).){1,220}|\/(?:(?!(?<!\\)\\[nrt"]).){1,220})/i
+      );
+      if (rawMatch && rawMatch[1]) {
+        return rawMatch[1].replace(/\\\\/g, '\\').trim();
+      }
+      return matchWorkingDirectoryHint(head);
     } finally {
       fs.closeSync(fd);
     }
@@ -369,15 +410,11 @@ export function deployCompanionPlugin({
     }
   }
   const mergedData = {
+    ...existingData,
     vaultPath: resolvedVault,
     dataPath: resolvedData,
     cliPath: path.join(resolvedData, 'cli', 'mem.mjs'),
-    nodePath,
-    ...existingData,
-    vaultPath: existingData.vaultPath || resolvedVault,
-    dataPath: existingData.dataPath || resolvedData,
-    cliPath: existingData.cliPath || path.join(resolvedData, 'cli', 'mem.mjs'),
-    nodePath: existingData.nodePath || nodePath
+    nodePath: nodePath || existingData.nodePath || process.execPath
   };
   fs.writeFileSync(pluginDataPath, JSON.stringify(mergedData, null, 2) + '\n', 'utf8');
 
@@ -412,6 +449,19 @@ export function deployCompanionPlugin({
 export async function runSetupWizard(options = {}) {
   const repoRoot = path.resolve(options.repoRoot || DEFAULT_REPO_ROOT);
   const env = options.env || process.env;
+  const isTty = options.isTty !== undefined ? Boolean(options.isTty) : Boolean(process.stdin?.isTTY);
+
+  // Fail fast before mutating any filesystem state if --authorize-autosync is called from untrusted context
+  if (options.authorizeAutosync) {
+    const gate = checkTrustedHumanTerminal({ env, isTty });
+    if (!gate.ok) {
+      const err = new Error(gate.reason);
+      err.exitCode = gate.exitCode;
+      err.code = 'ERR_UNTRUSTED_AUTO_SYNC_AUTH';
+      throw err;
+    }
+  }
+
   const resolved = resolveConfiguredPaths({
     vaultPath: options.vaultPath,
     dataPath: options.dataPath,
@@ -420,8 +470,30 @@ export async function runSetupWizard(options = {}) {
     env
   });
 
-  const vaultPath = resolved.vaultPath;
-  const dataPath = resolved.dataPath;
+  const isInteractive = !options.yes && !options.nonInteractive && (typeof options.promptFn === 'function' || isTty);
+  const askUser = async (questionText) => {
+    if (typeof options.promptFn === 'function') {
+      return await options.promptFn(questionText);
+    }
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    try {
+      return await rl.question(questionText);
+    } finally {
+      rl.close();
+    }
+  };
+
+  let vaultPath = resolved.vaultPath;
+  let dataPath = resolved.dataPath;
+  if (isInteractive && !options.vaultPath) {
+    const ans = String(await askUser(`Obsidian Vault directory [${vaultPath}]: `) || '').trim();
+    if (ans) vaultPath = path.resolve(ans);
+  }
+  if (isInteractive && !options.dataPath) {
+    const defaultData = options.vaultPath || vaultPath !== resolved.vaultPath ? `${vaultPath}-Data` : dataPath;
+    const ans = String(await askUser(`MindLoom Data directory [${defaultData}]: `) || '').trim();
+    dataPath = ans ? path.resolve(ans) : path.resolve(defaultData);
+  }
 
   // 1. Preflight checks
   const preflight = await runPreflightChecks({ vaultPath, dataPath });
@@ -456,9 +528,8 @@ export async function runSetupWizard(options = {}) {
   });
 
   let selectedWorkspaces = discovered;
-  const isInteractive = !options.yes && !options.nonInteractive && typeof options.promptFn === 'function';
   if (isInteractive && discovered.length > 0) {
-    const answer = await options.promptFn(
+    const answer = await askUser(
       `Discovered ${discovered.length} workspace(s): ${discovered.map((d) => d.project).join(', ')}. Include all in project-map.json? [Y/n] `
     );
     if (/^n(o)?$/i.test(String(answer || '').trim())) {
@@ -467,23 +538,27 @@ export async function runSetupWizard(options = {}) {
   }
 
   const projectMapPath = path.join(dataPath, 'manifests', 'project-map.json');
-  let existingMap = null;
-  if (fs.existsSync(projectMapPath)) {
-    try {
-      existingMap = JSON.parse(fs.readFileSync(projectMapPath, 'utf8'));
-    } catch {
-      existingMap = null;
+  const { addedProjects } = withWriteLock({ dataPath, command: 'setup-project-map' }, () => {
+    let existingMap = null;
+    if (fs.existsSync(projectMapPath)) {
+      try {
+        existingMap = JSON.parse(fs.readFileSync(projectMapPath, 'utf8'));
+      } catch {
+        existingMap = null;
+      }
     }
-  }
-  const { projectMap, addedProjects } = mergeProjectMapEntries(existingMap, selectedWorkspaces);
-  fs.writeFileSync(projectMapPath, JSON.stringify(projectMap, null, 2) + '\n', 'utf8');
+    const merged = mergeProjectMapEntries(existingMap, selectedWorkspaces);
+    fs.writeFileSync(projectMapPath, JSON.stringify(merged.projectMap, null, 2) + '\n', 'utf8');
+    return merged;
+  });
 
-  // 4. Write install config
+  // 4. Write install config (including repoRoot for copy-ready admin scripts)
   const configWrite = writeInstallConfig({
     vaultPath,
     dataPath,
     operatorRoot: resolved.operatorRoot,
-    configPath: resolved.configPath
+    configPath: resolved.configPath,
+    extra: { repoRoot }
   });
 
   // 5. Deploy companion Obsidian plugin
@@ -500,17 +575,6 @@ export async function runSetupWizard(options = {}) {
   let scheduler = { applied: false, status: 'skipped' };
 
   if (options.authorizeAutosync) {
-    const gate = checkTrustedHumanTerminal({
-      env,
-      isTty: options.isTty !== undefined ? Boolean(options.isTty) : Boolean(process.stdin?.isTTY)
-    });
-    if (!gate.ok) {
-      const err = new Error(gate.reason);
-      err.exitCode = gate.exitCode;
-      err.code = 'ERR_UNTRUSTED_AUTO_SYNC_AUTH';
-      throw err;
-    }
-
     let confirmed = false;
     if (typeof options.confirmAuthorizeFn === 'function') {
       confirmed = (await options.confirmAuthorizeFn()) === 'YES';
@@ -580,17 +644,21 @@ export async function runSetupWizard(options = {}) {
     authorization = { authorized: true, status: 'issued', autoSyncConfigPath, ...issued };
 
     if (!options.skipScheduler) {
+      const effPlatform = options.platform || process.platform;
+      const winRunnerCand = path.join(repoRoot, 'scripts', 'auto-sync-memory.ps1');
+      const useWinRunner =
+        effPlatform === 'win32' &&
+        fs.existsSync(winRunnerCand) &&
+        !winRunnerCand.replace(/\\/g, '/').includes('/_npx/');
       const plan = generateSchedulePlan({
-        platform: options.platform || process.platform,
+        platform: effPlatform,
+        linuxBackend: options.linuxBackend || 'auto',
         times: options.times || ['12:20', '21:20'],
         memCliPath: path.join(dataPath, 'cli', 'mem.mjs'),
         vaultDir: vaultPath,
         dataDir: dataPath,
         configPath: autoSyncConfigPath,
-        runnerScriptPath:
-          (options.platform || process.platform) === 'win32'
-            ? path.join(repoRoot, 'scripts', 'auto-sync-memory.ps1')
-            : null
+        runnerScriptPath: useWinRunner ? winRunnerCand : null
       });
       scheduler = applySchedulePlan(plan, { dryRun: Boolean(options.dryRunScheduler) });
     }

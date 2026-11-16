@@ -88,11 +88,15 @@ export function buildWindowsScheduledTaskPlan({
 
   const useRunner = Boolean(runnerScriptPath);
   const safeRunner = useRunner ? assertSafeString(path.resolve(runnerScriptPath), 'runnerScriptPath') : null;
+  const safeCfgPart =
+    useRunner && configPath
+      ? ` + " -ConfigPath " + '"' + ${quotePowerShellArg(assertSafeString(path.resolve(configPath), 'configPath'))} + '"'`
+      : '';
   const triggerExpr = parsedTimes.map((t) => `(New-ScheduledTaskTrigger -Daily -At ${quotePowerShellArg(t.raw)})`).join(', ');
   const scriptLines = [
     '$ErrorActionPreference = "Stop"',
     useRunner
-      ? `$argLine = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File " + '"' + ${quotePowerShellArg(safeRunner)} + '"' + " -VaultDir " + '"' + ${quotePowerShellArg(path.resolve(vaultDir))} + '"' + " -DataDir " + '"' + ${quotePowerShellArg(path.resolve(dataDir))} + '"'`
+      ? `$argLine = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File " + '"' + ${quotePowerShellArg(safeRunner)} + '"' + " -VaultDir " + '"' + ${quotePowerShellArg(path.resolve(vaultDir))} + '"' + " -DataDir " + '"' + ${quotePowerShellArg(path.resolve(dataDir))} + '"'${safeCfgPart}`
       : `$argLine = ${quotePowerShellArg(args.map((a) => `"${a.replace(/"/g, '\\"')}"`).join(' '))}`,
     useRunner
       ? `$exe = if (Get-Command pwsh -ErrorAction SilentlyContinue) { (Get-Command pwsh).Source } else { 'powershell.exe' }`
@@ -284,9 +288,19 @@ WantedBy=timers.target
   };
 }
 
+function detectLinuxBackend({ runner = execFileSync } = {}) {
+  try {
+    runner('systemctl', ['--user', 'show-environment'], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+    return 'systemd';
+  } catch {
+    return 'crontab';
+  }
+}
+
 export function generateSchedulePlan({
   platform = process.platform,
   linuxBackend = 'systemd',
+  runner = execFileSync,
   ...opts
 }) {
   if (platform === 'win32') {
@@ -296,7 +310,19 @@ export function generateSchedulePlan({
     return buildMacOsLaunchdPlan(opts);
   }
   if (platform === 'linux') {
-    return buildLinuxSchedulerPlan({ backend: linuxBackend, ...opts });
+    let effectiveBackend = linuxBackend;
+    let existingCrontab = opts.existingCrontab;
+    if (linuxBackend === 'auto') {
+      effectiveBackend = detectLinuxBackend({ runner });
+    }
+    if (effectiveBackend === 'crontab' && existingCrontab === undefined) {
+      try {
+        existingCrontab = runner('crontab', ['-l'], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+      } catch {
+        existingCrontab = '';
+      }
+    }
+    return buildLinuxSchedulerPlan({ backend: effectiveBackend, ...opts, existingCrontab });
   }
   throw new Error(`UNSUPPORTED_PLATFORM: scheduler does not support platform "${platform}"`);
 }
@@ -307,10 +333,21 @@ export function applySchedulePlan(plan, { dryRun = false, runner = execFileSync 
   }
 
   if (plan.platform === 'win32') {
-    runner('pwsh', ['-NoProfile', '-NonInteractive', '-Command', plan.scriptContent], {
-      encoding: 'utf8',
-      stdio: ['pipe', 'pipe', 'pipe']
-    });
+    try {
+      runner('pwsh', ['-NoProfile', '-NonInteractive', '-Command', plan.scriptContent], {
+        encoding: 'utf8',
+        stdio: ['pipe', 'pipe', 'pipe']
+      });
+    } catch (err) {
+      if (err && err.code === 'ENOENT') {
+        runner('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', plan.scriptContent], {
+          encoding: 'utf8',
+          stdio: ['pipe', 'pipe', 'pipe']
+        });
+      } else {
+        throw err;
+      }
+    }
     return { applied: true, dryRun: false, backend: plan.backend, taskName: plan.taskName };
   }
 

@@ -36,6 +36,7 @@ export interface SearchItem {
   lifecycle?: string;
   review_state?: string;
   sources?: string[];
+  event_anchors?: string[];
   snippet?: string;
   injectionDetected?: boolean;
 }
@@ -100,7 +101,9 @@ export interface ProposalShowResponse {
   id: string;
   title: string;
   privacy: string;
+  path?: string;
   target_id: string;
+  target_path?: string | null;
   base_revision_id: string;
   proposal_kind: string;
   proposal_status: string;
@@ -108,8 +111,8 @@ export interface ProposalShowResponse {
   reconcile_reason: string | null;
   condition_checks?: {
     passed: boolean;
-    pre_conditions?: Array<{ label?: string; text?: string; satisfied?: boolean }>;
-    post_conditions?: Array<{ label?: string; text?: string; satisfied?: boolean }>;
+    pre_conditions?: Array<{ text?: string; kind?: string; passed?: boolean; satisfied?: boolean }>;
+    post_conditions?: Array<{ text?: string; kind?: string; passed?: boolean; satisfied?: boolean }>;
   } | null;
   base_revision_diff?: {
     base_revision_id?: string;

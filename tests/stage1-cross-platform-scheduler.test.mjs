@@ -160,4 +160,49 @@ test('Stage 1: Cross-platform paths, scheduler dry-run, and atomic publisher', a
     fs.appendFileSync(destPath, 'appended\n', 'utf8');
     assert.ok(fs.readFileSync(destPath, 'utf8').includes('appended'));
   });
+
+  await t.test('6. Scheduler runner -ConfigPath, Windows pwsh->powershell.exe fallback, and Linux auto backend fallback', () => {
+    const winPlanWithRunner = generateSchedulePlan({
+      platform: 'win32',
+      memCliPath: 'C:\\MindLoom-Data\\cli\\mem.mjs',
+      vaultDir: 'C:\\MindLoom',
+      dataDir: 'C:\\MindLoom-Data',
+      configPath: 'C:\\MindLoom-Data\\manifests\\auto-sync-config.json',
+      runnerScriptPath: 'C:\\MindLoom\\scripts\\auto-sync-memory.ps1'
+    });
+    assert.match(winPlanWithRunner.scriptContent, /-ConfigPath/);
+    assert.match(winPlanWithRunner.scriptContent, /auto-sync-config\.json/);
+
+    const calls = [];
+    const fallbackApply = applySchedulePlan(winPlanWithRunner, {
+      dryRun: false,
+      runner: (exe) => {
+        calls.push(exe);
+        if (exe === 'pwsh') {
+          const e = new Error('pwsh not found');
+          e.code = 'ENOENT';
+          throw e;
+        }
+        return '';
+      }
+    });
+    assert.equal(fallbackApply.applied, true);
+    assert.deepEqual(calls, ['pwsh', 'powershell.exe']);
+
+    const autoLinuxPlan = generateSchedulePlan({
+      platform: 'linux',
+      linuxBackend: 'auto',
+      memCliPath: '/opt/mindloom/cli/mem.mjs',
+      vaultDir: '/home/alice/MindLoom',
+      dataDir: '/home/alice/MindLoom-Data',
+      homeDir: '/home/alice',
+      runner: (exe) => {
+        if (exe === 'systemctl') throw new Error('no systemd bus');
+        if (exe === 'crontab') return '0 4 * * * /bin/true\n';
+        return '';
+      }
+    });
+    assert.equal(autoLinuxPlan.backend, 'crontab');
+    assert.ok(autoLinuxPlan.mergedCrontab.includes('0 4 * * * /bin/true'));
+  });
 });
