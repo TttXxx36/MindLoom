@@ -57,7 +57,10 @@ const isEntrypoint = process.argv[1] && path.resolve(process.argv[1]) === path.r
 if (isEntrypoint) {
   const tagIdx = process.argv.indexOf('--tag');
   const cliTag = tagIdx !== -1 ? process.argv[tagIdx + 1] : null;
-  const envTag = process.env.RELEASE_TAG || process.env.GITHUB_REF_NAME || null;
+  const isTagRef =
+    process.env.GITHUB_REF_TYPE === 'tag' ||
+    String(process.env.GITHUB_REF || '').startsWith('refs/tags/');
+  const envTag = process.env.RELEASE_TAG || (isTagRef ? process.env.GITHUB_REF_NAME : null) || null;
   const tag = cliTag || envTag || null;
   const res = verifyReleaseAssets({ tag });
   process.stdout.write(`RELEASE ASSETS OK: v${res.version} (main.js=${res.mainBytes} bytes)\n`);

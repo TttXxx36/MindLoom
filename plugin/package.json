@@ -1,6 +1,6 @@
 {
   "name": "mindloom-obsidian-plugin",
-  "version": "1.0.1-beta.1",
+  "version": "1.0.1-beta.2",
   "description": "MindLoom companion console plugin for Obsidian",
   "main": "dist/main.js",
   "scripts": {
