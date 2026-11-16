@@ -3,6 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { parseProposalContent, checkProposalReconcileState } from '../reconcile/engine.mjs';
 import { sanitizeOutputText } from '../security/sanitizer.mjs';
+import { evaluateSanitizedVisibility } from '../security/privacy-gate.mjs';
 import { verifyEgressApproval } from '../security/trusted-approvals.mjs';
 import { parseMarkdownFrontmatter } from '../schema/frontmatter.mjs';
 import { findMarkdownFiles } from '../storage/path-sanitizer.mjs';
@@ -798,20 +799,10 @@ export function searchKnowledge({
   const effectiveTodayStr = todayStr || getBeijingTodayStr();
 
   for (const { filePath, raw, frontmatter, body } of knowledgeDocs) {
-    // Exit B 铁律 (§3.2): 仅允许 privacy === 'sanitized' 进入任何返回通道；local_only / 缺失 / 非法一律剥离
-    if (frontmatter.privacy !== 'sanitized') {
+    // Exit B 统一公开门禁 (§3.2): 核对磁盘 frontmatter 与 SQLite notes 状态
+    const noteRow = db && frontmatter.id ? (dbNoteById.get(frontmatter.id) || null) : null;
+    if (!evaluateSanitizedVisibility({ frontmatter, dbRow: noteRow, checkResidualSecrets: false }).allowed) {
       continue;
-    }
-
-    // 检查 SQLite notes 表状态与真实隐私登记 (O(1) 内存映射查表，防止通过篡改 YAML privacy 绕过 Exit B)
-    let noteRow = null;
-    if (db) {
-      if (frontmatter.id) {
-        noteRow = dbNoteById.get(frontmatter.id) || null;
-      }
-      if (noteRow && (noteRow.status === 'missing' || noteRow.status === 'deleted' || (noteRow.privacy && noteRow.privacy !== 'sanitized'))) {
-        continue;
-      }
     }
 
     // 项目过滤（防跨项目误用 C01）

@@ -110,9 +110,14 @@ node cli/mem.mjs auto-sync --dry-run --json         # Preview whitelist sync can
 node cli/mem.mjs render-moc --update-digests        # Rebuild 00_MOC/ & Digest Brief
 node cli/mem.mjs search "401" --mode literal        # Offline Mode 0 search
 node cli/mem.mjs reconcile                          # Sync renames/missing & verify proposals
-node cli/mem.mjs restore <ID> --revision rev-0001   # Preview or --confirm atomic restore
+node cli/mem.mjs recover-publish                    # Reconcile interrupted/unregistered publishes
+node cli/mem.mjs restore <ID> --revision rev-0001   # Preview or --confirm single-note restore
 node cli/mem.mjs backup --target /path/to/backups   # Consistent WAL-checkpointed backup
+node cli/mem.mjs restore-backup --backup <dir> --vault <new-v> --data <new-d> [--switch]
+node cli/mem.mjs use --vault <v> --data <d>         # Switch active global default Vault/Data
 ```
+
+See [Support Matrix & Lifecycle Boundaries](docs/SUPPORT_MATRIX.md) for isolation tiers, source-of-truth rules, and withdrawal vs. purge guarantees.
 
 ---
 

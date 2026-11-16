@@ -61,15 +61,27 @@ export function assertPublisherUnlocked(stagingDir) {
   }
 }
 
+function inferNoteTypeFromPath(filePath) {
+  const norm = String(filePath || '').replace(/\\/g, '/');
+  if (norm.includes('/10_Readable_Sessions/')) return 'session';
+  if (norm.includes('/20_Evidence_Cards/')) return 'evidence';
+  if (norm.includes('/40_Review_Queue/')) return 'proposal';
+  if (norm.includes('/30_Knowledge_Notes/Decisions/')) return 'decision';
+  if (norm.includes('/30_Knowledge_Notes/Project_States/')) return 'project_state';
+  if (norm.includes('/30_Knowledge_Notes/Preferences/')) return 'preference';
+  return 'playbook';
+}
+
 function extractFallbackMetadata(filePath, nowIso) {
   if (!filePath || !fs.existsSync(filePath)) return null;
   try {
     const raw = fs.readFileSync(filePath, 'utf8');
-    const { frontmatter } = parseMarkdownFrontmatter(raw);
-    if (!frontmatter.note_type) return null;
+    const parsed = parseMarkdownFrontmatter(raw);
+    const frontmatter = parsed.frontmatter || {};
+    if (!frontmatter.note_type && !frontmatter.id && !parsed.hasFrontmatter) return null;
     return {
-      note_type: frontmatter.note_type,
-      title: frontmatter.title || 'Untitled',
+      note_type: frontmatter.note_type || inferNoteTypeFromPath(filePath),
+      title: frontmatter.title || path.basename(filePath, '.md') || 'Untitled',
       project: frontmatter.project || 'Default',
       privacy: frontmatter.privacy || 'local_only',
       lifecycle: frontmatter.lifecycle || 'active',
@@ -81,6 +93,22 @@ function extractFallbackMetadata(filePath, nowIso) {
     };
   } catch {
     return null;
+  }
+}
+
+function runInSavepoint(db, savepointName, fn) {
+  db.exec(`SAVEPOINT ${savepointName}`);
+  try {
+    const out = fn();
+    db.exec(`RELEASE SAVEPOINT ${savepointName}`);
+    return out;
+  } catch (err) {
+    try {
+      db.exec(`ROLLBACK TO SAVEPOINT ${savepointName}; RELEASE SAVEPOINT ${savepointName}`);
+    } catch {
+      // ignore rollback failure if connection aborted
+    }
+    throw err;
   }
 }
 
@@ -263,19 +291,21 @@ export function publishFile({
       if (fs.existsSync(stagingPath)) {
         fs.unlinkSync(stagingPath);
       }
-      db.prepare(`
-        INSERT INTO publish_intents (operation_id, output_uuid, staging_path, target_path, content_sha256, state, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, 'files_published', ?, ?)
-        ON CONFLICT(operation_id) DO UPDATE SET
-          target_path = excluded.target_path,
-          state = 'files_published',
-          updated_at = excluded.updated_at
-      `).run(operationId, outputUuid, stagingPath, actualTargetPath, contentSha256, nowIso, nowIso);
-
       const effectiveMetadata = metadata || extractFallbackMetadata(actualTargetPath, nowIso);
-      if (effectiveMetadata) {
-        recordNoteInDb(db, outputUuid, actualTargetPath, contentSha256, effectiveMetadata, nowIso);
-      }
+      runInSavepoint(db, 'publish_retry_ledger', () => {
+        db.prepare(`
+          INSERT INTO publish_intents (operation_id, output_uuid, staging_path, target_path, content_sha256, state, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, 'files_published', ?, ?)
+          ON CONFLICT(operation_id) DO UPDATE SET
+            target_path = excluded.target_path,
+            state = 'files_published',
+            updated_at = excluded.updated_at
+        `).run(operationId, outputUuid, stagingPath, actualTargetPath, contentSha256, nowIso, nowIso);
+
+        if (effectiveMetadata) {
+          recordNoteInDb(db, outputUuid, actualTargetPath, contentSha256, effectiveMetadata, nowIso);
+        }
+      });
 
       if (revisionsDir && fs.existsSync(actualTargetPath)) {
         try {
@@ -346,18 +376,19 @@ export function publishFile({
   // 3. 断开暂存侧链接
   fs.unlinkSync(stagingPath);
 
-  // 4. 更新台账状态为 files_published
-  db.prepare(`
-    UPDATE publish_intents
-    SET state = 'files_published', updated_at = ?
-    WHERE operation_id = ?
-  `).run(nowIso, operationId);
-
-  // 5. 若传入 metadata 或文件含合法 Frontmatter，记录到 notes 表中
+  // 4+5. 同 SQLite 事务内原子提交 files_published 状态与 notes 台账登记，杜绝“已落盘但漏登记”半状态
   const effectiveMetadata = metadata || extractFallbackMetadata(actualTargetPath, nowIso);
-  if (effectiveMetadata) {
-    recordNoteInDb(db, outputUuid, actualTargetPath, contentSha256, effectiveMetadata, nowIso);
-  }
+  runInSavepoint(db, 'publish_commit_ledger', () => {
+    db.prepare(`
+      UPDATE publish_intents
+      SET state = 'files_published', updated_at = ?
+      WHERE operation_id = ?
+    `).run(nowIso, operationId);
+
+    if (effectiveMetadata) {
+      recordNoteInDb(db, outputUuid, actualTargetPath, contentSha256, effectiveMetadata, nowIso);
+    }
+  });
 
   // 6. 保存本地基准版本快照 (供 mem restore 提取历史版本)
   if (revisionsDir && fs.existsSync(actualTargetPath)) {
@@ -397,12 +428,14 @@ export function recoverInterruptedPublish({ db, operationId, revisionsDir = null
     : db.prepare('SELECT * FROM publish_intents WHERE state = ?').all('linking');
 
   const results = [];
+  const handledOps = new Set();
   const nowIso = new Date().toISOString();
 
   for (const intent of query) {
     const { staging_path: stagingPath, target_path: targetPath, output_uuid: outputUuid, operation_id: opId, content_sha256: contentSha } = intent;
     let finalTargetPath = null;
     let action = null;
+    let updatedTargetForDb = null;
 
     // 检查 targetPath 是否存在
     if (fs.existsSync(targetPath)) {
@@ -413,13 +446,6 @@ export function recoverInterruptedPublish({ db, operationId, revisionsDir = null
         if (fs.existsSync(stagingPath)) {
           fs.unlinkSync(stagingPath);
         }
-
-        db.prepare(`
-          UPDATE publish_intents
-          SET state = 'files_published', updated_at = ?
-          WHERE operation_id = ?
-        `).run(nowIso, opId);
-
         finalTargetPath = targetPath;
         action = 'unlinked_staging_kept_user_content';
       } else {
@@ -447,12 +473,7 @@ export function recoverInterruptedPublish({ db, operationId, revisionsDir = null
           fs.unlinkSync(stagingPath);
         }
 
-        db.prepare(`
-          UPDATE publish_intents
-          SET target_path = ?, state = 'files_published', updated_at = ?
-          WHERE operation_id = ?
-        `).run(expandedTargetPath, nowIso, opId);
-
+        updatedTargetForDb = expandedTargetPath;
         finalTargetPath = expandedTargetPath;
         action = 'disambiguated_collision_expanded';
       }
@@ -465,30 +486,41 @@ export function recoverInterruptedPublish({ db, operationId, revisionsDir = null
       linkFileAtomically(stagingPath, targetPath);
       fs.unlinkSync(stagingPath);
 
-      db.prepare(`
-        UPDATE publish_intents
-        SET state = 'files_published', updated_at = ?
-        WHERE operation_id = ?
-      `).run(nowIso, opId);
-
       finalTargetPath = targetPath;
       action = 'completed_link_and_unlink';
     }
 
     if (finalTargetPath && fs.existsSync(finalTargetPath)) {
-      // 确保 notes 表同步登记 R1 恢复后的正式笔记（绝不遗漏未执行第 5 步的崩溃作业）
       const fallbackMeta = extractFallbackMetadata(finalTargetPath, nowIso);
       const currentSha = calculateSha256(fs.readFileSync(finalTargetPath, 'utf8'));
-      const existingNote = db.prepare('SELECT id FROM notes WHERE id = ?').get(outputUuid);
-      if (!existingNote && fallbackMeta) {
-        recordNoteInDb(db, outputUuid, finalTargetPath, currentSha || contentSha, fallbackMeta, nowIso);
-      } else if (existingNote) {
-        db.prepare(`
-          UPDATE notes
-          SET path = ?, status = 'active', content_sha256 = COALESCE(?, content_sha256), updated_at = ?
-          WHERE id = ?
-        `).run(finalTargetPath, currentSha || contentSha || null, nowIso, outputUuid);
-      }
+
+      // 同 SQLite 事务提交 files_published 与 notes 登记/刷新
+      runInSavepoint(db, 'recover_linking_ledger', () => {
+        if (updatedTargetForDb) {
+          db.prepare(`
+            UPDATE publish_intents
+            SET target_path = ?, state = 'files_published', updated_at = ?
+            WHERE operation_id = ?
+          `).run(updatedTargetForDb, nowIso, opId);
+        } else {
+          db.prepare(`
+            UPDATE publish_intents
+            SET state = 'files_published', updated_at = ?
+            WHERE operation_id = ?
+          `).run(nowIso, opId);
+        }
+
+        const existingNote = db.prepare('SELECT id FROM notes WHERE id = ?').get(outputUuid);
+        if (!existingNote && fallbackMeta) {
+          recordNoteInDb(db, outputUuid, finalTargetPath, currentSha || contentSha, fallbackMeta, nowIso);
+        } else if (existingNote) {
+          db.prepare(`
+            UPDATE notes
+            SET path = ?, status = 'active', content_sha256 = COALESCE(?, content_sha256), updated_at = ?
+            WHERE id = ?
+          `).run(finalTargetPath, currentSha || contentSha || null, nowIso, outputUuid);
+        }
+      });
 
       if (revisionsDir) {
         try {
@@ -503,6 +535,7 @@ export function recoverInterruptedPublish({ db, operationId, revisionsDir = null
         }
       }
 
+      handledOps.add(opId);
       results.push({
         operationId: opId,
         outputUuid,
@@ -511,6 +544,70 @@ export function recoverInterruptedPublish({ db, operationId, revisionsDir = null
         targetPath: finalTargetPath
       });
     }
+  }
+
+  // 修复“文件已落盘且 publish_intents=files_published，但 notes 台账漏登记”的半状态意图
+  const orphanIntents = operationId
+    ? db.prepare(`
+        SELECT p.*
+        FROM publish_intents p
+        LEFT JOIN notes n ON n.id = p.output_uuid
+        WHERE p.operation_id = ? AND p.state = 'files_published' AND n.id IS NULL
+      `).all(operationId)
+    : db.prepare(`
+        SELECT p.*
+        FROM publish_intents p
+        LEFT JOIN notes n ON n.id = p.output_uuid
+        WHERE p.state = 'files_published' AND n.id IS NULL
+      `).all();
+
+  for (const intent of orphanIntents) {
+    const { staging_path: stagingPath, target_path: targetPath, output_uuid: outputUuid, operation_id: opId, content_sha256: contentSha } = intent;
+    if (handledOps.has(opId)) continue;
+    if (!targetPath || !fs.existsSync(targetPath)) continue;
+
+    const targetId = readFrontmatterId(targetPath);
+    if (targetId !== outputUuid) continue;
+
+    const fallbackMeta = extractFallbackMetadata(targetPath, nowIso);
+    if (!fallbackMeta) continue;
+
+    if (stagingPath && fs.existsSync(stagingPath) && readFrontmatterId(stagingPath) === outputUuid) {
+      try {
+        fs.unlinkSync(stagingPath);
+      } catch {
+        // best-effort staging cleanup when target already matches uuid
+      }
+    }
+
+    const currentSha = calculateSha256(fs.readFileSync(targetPath, 'utf8'));
+    runInSavepoint(db, 'recover_orphan_published_ledger', () => {
+      const stillMissing = !db.prepare('SELECT id FROM notes WHERE id = ?').get(outputUuid);
+      if (stillMissing) {
+        recordNoteInDb(db, outputUuid, targetPath, currentSha || contentSha, fallbackMeta, nowIso);
+      }
+    });
+
+    if (revisionsDir) {
+      try {
+        const noteRevDir = path.join(revisionsDir, outputUuid);
+        if (!fs.existsSync(noteRevDir)) fs.mkdirSync(noteRevDir, { recursive: true });
+        const finalContent = fs.readFileSync(targetPath, 'utf8');
+        const rev1 = path.join(noteRevDir, 'rev-0001.md');
+        if (!fs.existsSync(rev1)) fs.writeFileSync(rev1, finalContent, 'utf8');
+        fs.writeFileSync(path.join(noteRevDir, 'latest.md'), finalContent, 'utf8');
+      } catch {
+        // ignore non-critical revision cache write failure
+      }
+    }
+
+    results.push({
+      operationId: opId,
+      outputUuid,
+      recovered: true,
+      action: 'reconciled_missing_note_record',
+      targetPath
+    });
   }
 
   return {

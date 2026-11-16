@@ -12,8 +12,8 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { initRepository, DEFAULT_VAULT_PATH, DEFAULT_DATA_PATH } from '../src/init.mjs';
 const DEFAULT_REPO_ROOT_HINT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-import { resolveConfiguredPaths, readInstallConfig, isSubPathOrSame, isNodeVersionSupported } from '../src/config/paths.mjs';
-import { validateVaultDataPairing } from '../src/storage/instance-identity.mjs';
+import { resolveConfiguredPaths, readInstallConfig, writeInstallConfig, getDefaultConfigPath, isSubPathOrSame, isNodeVersionSupported } from '../src/config/paths.mjs';
+import { validateVaultDataPairing, assertVaultDataIsolation } from '../src/storage/instance-identity.mjs';
 import { runSetupWizard } from '../src/setup/wizard.mjs';
 import { DEFAULT_PRICING_CATALOG } from '../src/security/cloud-approvals.mjs';
 import { DEFAULT_OPERATOR_ROOT, buildOperatorIsolationTargets } from '../src/security/isolation-sentinel.mjs';
@@ -28,7 +28,7 @@ import {
 } from '../src/reconcile/engine.mjs';
 import { searchKnowledge, getBeijingTodayStr } from '../src/search/query-engine.mjs';
 import { restoreNote } from '../src/storage/restore-manager.mjs';
-import { stageCandidate, publishFile } from '../src/storage/atomic-publisher.mjs';
+import { stageCandidate, publishFile, recoverInterruptedPublish } from '../src/storage/atomic-publisher.mjs';
 import { withWriteLock, recoverStaleWriteLock, inspectWriteLockFile, recordOperationSettlement } from '../src/storage/write-lock.mjs';
 import { resolveTargetFilePath } from '../src/storage/path-sanitizer.mjs';
 import { parseMarkdownFrontmatter } from '../src/schema/frontmatter.mjs';
@@ -48,7 +48,7 @@ import { rebuildVaultMocAndHome } from '../src/ingest/human-digest.mjs';
 import { runWhitelistAutoSync } from '../src/ingest/auto-sync.mjs';
 import { previewDistillSession } from '../src/distill/llm-distiller.mjs';
 import { exportEgressPackage } from '../src/egress/egress-controller.mjs';
-import { createConsistentBackup } from '../src/backup/backup-manager.mjs';
+import { createConsistentBackup, restoreFromBackup } from '../src/backup/backup-manager.mjs';
 import { runBenchmarkSuite } from '../src/benchmark/runner.mjs';
 
 function safeLog(text) {
@@ -352,10 +352,14 @@ function isMarkdownPrivacySanitized(rawContent) {
 }
 
 function isVaultNoteSanitizedForExitB(db, filePath, noteId) {
+  let dbVerifiedSanitized = false;
   if (db && noteId) {
     try {
       const row = db.prepare('SELECT privacy FROM notes WHERE id = ?').get(noteId);
-      if (row && row.privacy !== 'sanitized') return false;
+      if (row) {
+        if (row.privacy !== 'sanitized') return false;
+        dbVerifiedSanitized = true;
+      }
     } catch {
       return false;
     }
@@ -367,7 +371,7 @@ function isVaultNoteSanitizedForExitB(db, filePath, noteId) {
       return false;
     }
   }
-  return true;
+  return dbVerifiedSanitized;
 }
 
 const command = process.argv[2];
@@ -388,21 +392,26 @@ function printUsage() {
   mem auto-sync [--source all|codex|antigravity|dsh] [--codex-approval <id>] [--antigravity-approval <id>] [--config <path>] [--lookback-days <n>] [--max-sessions <n>] [--dry-run] [--no-moc] [--json]
                                                                     白名单低敏增量同步（跳过未映射项目，可选自动刷新 00_MOC 与 首页.md）
   mem render-moc [--update-digests] [--vault <path>] [--data <path>] [--json]
-                                                                    重建 00_MOC/ 项目知识地图、学习简报与首页.md（仅纳入 sanitized 笔记）
+                                                                    重建 00_MOC/ 项目知识地图、学习简报与首页.md（自动撤回空/降级项，保留手写页）
   mem distill --session <SES-id|path> [--range start:end] --dry-run [--json]
                                                                     离线零出站预览 Distill 提炼载荷；实网提炼请使用 mem-operator.mjs distill
   mem export-egress --snapshot <id> --approval <egr-id> --input <f> 出口 A 门禁核验与脱敏外发打包
   mem stage-candidate --input <candidate.json> [--operation <id>]   校验提炼候选并以 wx 独占不覆写方式写入 staging/
   mem publish --operation <op-id>                                   执行原子发布 (NTFS硬链接 + R7消歧 + 白名单Git)
   mem recover-lock                                                  专用陈旧写锁恢复：获取正常 write.lock 后安全推进 R1 台账/文件/Git 恢复
+  mem recover-publish [--operation <op-id>] [--vault <v>] [--data <d>] [--json]
+                                                                    无死锁状态下显式恢复未决 linking 作业或修复已落盘漏登记 notes 的发布意图
   mem proposal show <proposal-id>                                   展示提案详情、与基准版本差异及双版本绑定的 reconcile_state
   mem reconcile                                                     扫描改名/缺失并执行提案采纳前后置条件核对
   mem search "<query>" [--mode literal|hybrid|rerank] [--project p] [--source codex|antigravity|dsh]
                                                                     检索双通道操作依据与历史线索 (默认 Mode 0)
-  mem delete <id> [--confirm]                                       标记并确认删除知识笔记，登记跨快照稳定墓碑
+  mem delete <id> [--confirm]                                       标记并确认删除知识笔记，登记跨快照稳定墓碑并按需同步 MOC 撤回
   mem restore <id> --revision <rev>                                 从指定历史版本恢复知识笔记 (原文件已删则原子恢复，未删则生成预览)
   mem status                                                        状态汇总（提案核对、快照前缀异常、到期复核、备份与墓碑）
   mem backup --target <external-path>                               执行 R4 停写备份窗口、指纹校验与 SQLite 一致备份
+  mem restore-backup --backup <dir> --vault <new-vault> --data <new-data> [--self-check <q>] [--allow-incomplete] [--switch] [--json]
+                                                                    整库灾备恢复至新空目录并重绑副本内清单/插件，可选 --switch 显式切换全局默认实例
+  mem use --vault <vault-path> [--data <data-path>] [--json]        校验目标双目录配对后显式切换全局默认 Vault/Data (~/.mindloom/config.json)
   mem benchmark --suite pilot|growth [--questions <p>] [--out <p>]  运行固定题集对比评测并输出完整指标报告
   mem project-map [list|upsert|remove] [--project <name>] [--json]  查看或校验编辑白名单 project-map.json
   mem cloud-budget [--json]                                         只读查看脱敏外发台账、模型单价目录与管理员命令引导
@@ -651,15 +660,24 @@ try {
 
     let dbStatus = 'uninitialized';
     let pendingLinking = 0;
+    let pendingMissingNoteRecords = 0;
     let pendingReauditSnapshots = 0;
     let pendingVersionChangedProposals = 0;
     if (fs.existsSync(effDbPath)) {
       const db = openExistingDatabase(effDbPath, { readOnly: true });
       try {
         pendingLinking = db.prepare("SELECT count(*) as c FROM publish_intents WHERE state = 'linking'").get().c;
+        pendingMissingNoteRecords = db.prepare(`
+          SELECT count(*) as c
+          FROM publish_intents p
+          LEFT JOIN notes n ON n.id = p.output_uuid
+          WHERE p.state = 'files_published' AND n.id IS NULL
+        `).get().c;
         pendingReauditSnapshots = db.prepare("SELECT count(*) as c FROM session_snapshots WHERE status = 'needs_reaudit'").get().c;
         pendingVersionChangedProposals = db.prepare("SELECT count(*) as c FROM reconcile_states WHERE reason = 'version_changed'").get().c;
-        dbStatus = pendingLinking > 0 ? 'pending_linking' : 'clean';
+        dbStatus = pendingLinking > 0
+          ? 'pending_linking'
+          : (pendingMissingNoteRecords > 0 ? 'pending_recovery' : 'clean');
       } finally {
         db.close();
       }
@@ -701,6 +719,7 @@ try {
         writeLockCommand: wlInfo?.payload?.command ?? null,
         dbStatus,
         pendingLinking,
+        pendingMissingNoteRecords,
         pendingReauditSnapshots,
         pendingVersionChangedProposals
       });
@@ -735,8 +754,8 @@ try {
       } else {
         safeLog(`  - 全局写锁状态: 正常 (无残留 write.lock)`);
       }
-      if (dbStatus === 'pending_linking') {
-        safeLog(`  - 异常中断提示: 发现 ${pendingLinking} 项未完成的 linking 操作，需执行恢复`);
+      if (dbStatus === 'pending_linking' || dbStatus === 'pending_recovery') {
+        safeLog(`  - 异常中断提示: 发现 ${pendingLinking} 项未完成 linking、${pendingMissingNoteRecords} 项已落盘漏登记 notes 意图，建议运行 mem recover-publish`);
       } else if (dbStatus === 'clean') {
         safeLog(`  - 意图台账状态: 干净 (零未决 linking 操作；待重审快照 ${pendingReauditSnapshots} 个，版本变更提案 ${pendingVersionChangedProposals} 项)`);
       } else if (dbStatus === 'missing_critical') {
@@ -1713,6 +1732,9 @@ try {
             revisionsDir: path.join(effDataPath, 'runtime', 'revisions'),
             archiveAsRev1: !hasPriorGitHistory
           });
+          if (fs.existsSync(path.join(effVaultPath, '00_MOC', '学习简报_最新会话精华.md'))) {
+            rebuildVaultMocAndHome({ db, vaultDir: effVaultPath });
+          }
           safeLog(`[mem delete 成功] 笔记已删除，已登记事实项墓碑: ${delRes.itemKey}`);
         } finally {
           db.close();
@@ -1868,6 +1890,9 @@ try {
                 gitState,
                 indexState: 'stale'
               });
+            }
+            if (fs.existsSync(path.join(effVaultPath, '00_MOC', '学习简报_最新会话精华.md'))) {
+              rebuildVaultMocAndHome({ db, vaultDir: effVaultPath });
             }
           }
 
@@ -2401,6 +2426,193 @@ try {
       }
     };
     safeLog(JSON.stringify(sanitizeObjectForExitB(report), null, 2));
+  } else if (command === 'recover-publish') {
+    const { values } = parseArgs({
+      args: process.argv.slice(3),
+      options: {
+        operation: { type: 'string' },
+        vault: { type: 'string' },
+        data: { type: 'string' },
+        json: { type: 'boolean' }
+      }
+    });
+    const effVaultPath = values.vault || vaultPath;
+    const effDataPath = values.data || dataPath;
+    const effDbPath = path.join(effDataPath, 'runtime', 'state.sqlite');
+    if (!fs.existsSync(effDbPath)) {
+      safeError(`数据库不存在: ${effDbPath}`);
+      process.exit(1);
+    }
+    assertVaultDataPaired({ dbPath: effDbPath, vaultPath: effVaultPath, dataPath: effDataPath });
+
+    const recRes = withWriteLock({ dataPath: effDataPath, command: 'recover-publish' }, () => {
+      const db = openExistingDatabase(effDbPath);
+      try {
+        const res = recoverInterruptedPublish({
+          db,
+          operationId: values.operation || undefined,
+          revisionsDir: path.join(effDataPath, 'runtime', 'revisions')
+        });
+        if (res.details && Array.isArray(res.details)) {
+          res.details = res.details.map((d) => {
+            const safe = isVaultNoteSanitizedForExitB(db, d.targetPath, d.outputUuid);
+            return safe ? d : { ...d, targetPath: '[REDACTED_LOCAL_ONLY]' };
+          });
+        }
+        return res;
+      } finally {
+        db.close();
+      }
+    });
+
+    if (values.json) {
+      safeLog(JSON.stringify(sanitizeObjectForExitB(recRes), null, 2));
+    } else {
+      safeLog(`[mem recover-publish] 恢复处理数: ${recRes.count}`);
+      for (const d of recRes.details) {
+        safeLog(`  - ${d.operationId} (${d.outputUuid}): ${d.action} -> ${d.targetPath}`);
+      }
+    }
+  } else if (command === 'restore-backup') {
+    const { values } = parseArgs({
+      args: process.argv.slice(3),
+      options: {
+        backup: { type: 'string' },
+        vault: { type: 'string' },
+        data: { type: 'string' },
+        'self-check': { type: 'string' },
+        'allow-incomplete': { type: 'boolean' },
+        switch: { type: 'boolean' },
+        json: { type: 'boolean' }
+      }
+    });
+    if (!values.backup || !values.vault || !values.data) {
+      safeError('用法: mem restore-backup --backup <backup-dir> --vault <new-vault-dir> --data <new-data-dir> [--self-check <query>] [--allow-incomplete] [--switch] [--json]');
+      process.exit(1);
+    }
+    assertVaultDataIsolation({ vaultPath: values.vault, dataPath: values.data });
+    const res = restoreFromBackup({
+      backupDir: values.backup,
+      newVaultPath: values.vault,
+      newDataPath: values.data,
+      allowIncomplete: Boolean(values['allow-incomplete']),
+      selfCheckQuery: values['self-check'] || null
+    });
+
+    let switched = false;
+    let switchInfo = null;
+    if (values.switch) {
+      assertVaultDataPaired({
+        dbPath: path.join(res.newDataPath, 'runtime', 'state.sqlite'),
+        vaultPath: res.newVaultPath,
+        dataPath: res.newDataPath
+      });
+      const cfgPath = getDefaultConfigPath();
+      const prevCfg = readInstallConfig(cfgPath);
+      const savedRepoRoot =
+        prevCfg.repoRoot && fs.existsSync(prevCfg.repoRoot) ? prevCfg.repoRoot : undefined;
+      const written = writeInstallConfig({
+        vaultPath: res.newVaultPath,
+        dataPath: res.newDataPath,
+        operatorRoot: prevCfg.operatorRoot || null,
+        configPath: cfgPath,
+        extra: {
+          restoredFromBackupId: res.backupId,
+          ...(savedRepoRoot ? { repoRoot: savedRepoRoot } : {})
+        }
+      });
+      switched = true;
+      switchInfo = {
+        configPath: written.configPath,
+        previousVaultPath: prevCfg.vaultPath || null,
+        previousDataPath: prevCfg.dataPath || null
+      };
+    }
+
+    const payload = {
+      ...res,
+      switched,
+      ...(switchInfo ? { switchInfo } : {})
+    };
+    if (values.json) {
+      safeLog(JSON.stringify(sanitizeObjectForExitB(payload), null, 2));
+    } else {
+      safeLog(`[mem restore-backup] 整库恢复完成 (${res.backupId}):`);
+      safeLog(`  - Vault: ${res.newVaultPath}`);
+      safeLog(`  - Data:  ${res.newDataPath}`);
+      safeLog(`  - 状态库完整性: ${res.verification.sqliteIntegrityOk} | 笔记数: ${res.verification.activeNotesCount} | R1恢复: ${res.r1Recovery.count}`);
+      if (res.reboundConfig?.pluginDataGenerated) {
+        safeLog(`  - 伴侣插件绑定: 已生成独立本地 data.json，指向恢复后的 Vault/Data`);
+      } else if (res.reboundConfig?.pluginBindingNote) {
+        safeLog(`  - 伴侣插件提示: ${res.reboundConfig.pluginBindingNote}`);
+      }
+      safeLog(`  - 默认实例切换 (--switch): ${switched ? `已切换 (${switchInfo.configPath})` : '否（原全局默认配置保持不变，可用 mem use 切换）'}`);
+    }
+  } else if (command === 'use') {
+    const { values } = parseArgs({
+      args: process.argv.slice(3),
+      options: {
+        vault: { type: 'string' },
+        data: { type: 'string' },
+        json: { type: 'boolean' }
+      }
+    });
+    if (!values.vault) {
+      safeError('用法: mem use --vault <vault-path> [--data <data-path>] [--json]');
+      process.exit(1);
+    }
+    const targetVault = path.resolve(values.vault);
+    const targetData = path.resolve(values.data || `${targetVault}-Data`);
+    const targetDbPath = path.join(targetData, 'runtime', 'state.sqlite');
+    if (!fs.existsSync(targetVault)) {
+      safeError(`TARGET_VAULT_MISSING: 目标 Vault 目录不存在 (${targetVault})`);
+      process.exit(1);
+    }
+    if (!fs.existsSync(targetDbPath)) {
+      safeError(`TARGET_DB_MISSING: 目标 Data 缺少 state.sqlite (${targetDbPath})`);
+      process.exit(1);
+    }
+    assertVaultDataIsolation({ vaultPath: targetVault, dataPath: targetData });
+    assertVaultDataPaired({ dbPath: targetDbPath, vaultPath: targetVault, dataPath: targetData });
+
+    const cfgPath = getDefaultConfigPath();
+    const prevCfg = readInstallConfig(cfgPath);
+    const manifestCfg = readInstallConfig(path.join(targetData, 'manifests', 'install-config.json'));
+    const repoRootHint =
+      [manifestCfg.repoRoot, prevCfg.repoRoot].find((p) => p && fs.existsSync(p)) || undefined;
+    const written = writeInstallConfig({
+      vaultPath: targetVault,
+      dataPath: targetData,
+      operatorRoot: prevCfg.operatorRoot || null,
+      configPath: cfgPath,
+      extra: {
+        ...(manifestCfg.restoredFromBackupId ? { restoredFromBackupId: manifestCfg.restoredFromBackupId } : {}),
+        ...(repoRootHint ? { repoRoot: repoRootHint } : {})
+      }
+    });
+
+    const outPayload = {
+      switched: true,
+      configPath: written.configPath,
+      manifestPath: written.manifestPath,
+      previousConfig: {
+        vaultPath: prevCfg.vaultPath || null,
+        dataPath: prevCfg.dataPath || null
+      },
+      activeConfig: {
+        vaultPath: written.config.vaultPath,
+        dataPath: written.config.dataPath
+      },
+      schedulerNote: 'Scheduled tasks are instance-scoped; run "mem setup --authorize-autosync" for the newly activated instance if needed.'
+    };
+    if (values.json) {
+      safeLog(JSON.stringify(sanitizeObjectForExitB(outPayload), null, 2));
+    } else {
+      safeLog(`[mem use] 已切换全局默认实例 (${written.configPath}):`);
+      safeLog(`  - Vault: ${written.config.vaultPath}`);
+      safeLog(`  - Data:  ${written.config.dataPath}`);
+      safeLog(`  - 定时任务提示: 定时调度按 Vault/Data 独立隔离，如需为新实例启用请运行 mem setup --authorize-autosync`);
+    }
   } else {
     safeError(`未知命令: ${command}`);
     printUsage();

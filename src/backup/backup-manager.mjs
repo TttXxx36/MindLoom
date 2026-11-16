@@ -7,6 +7,7 @@ import { recoverInterruptedPublish } from '../storage/atomic-publisher.mjs';
 import { scanAndSyncNotes } from '../tombstone/tracker.mjs';
 import { buildLocalSearchIndex, searchKnowledge } from '../search/query-engine.mjs';
 import { rotateInstanceIdentityOnRestore } from '../storage/instance-identity.mjs';
+import { readInstallConfig, writeInstallConfig } from '../config/paths.mjs';
 import {
   lockRestoredCloudApprovals,
   openOperatorDatabase
@@ -726,12 +727,106 @@ export function restoreFromBackup({
       }
     }
 
+    // Step 6b: 重绑恢复副本内部的实例清单、auto-sync 配置与伴侣插件路径（不改动宿主全局 ~/.mindloom/config.json）
+    const reboundConfig = {
+      installConfigManifestPath: null,
+      autoSyncConfigRebound: false,
+      pluginDataRebound: false,
+      pluginDataGenerated: false,
+      pluginBindingNote: null
+    };
+
+    const restoredInstallCfgPath = path.join(resolvedNewData, 'manifests', 'install-config.json');
+    const prevInstallCfg = readInstallConfig(restoredInstallCfgPath);
+    const preservedRepoRoot =
+      prevInstallCfg.repoRoot && fs.existsSync(prevInstallCfg.repoRoot)
+        ? prevInstallCfg.repoRoot
+        : undefined;
+    const writtenInstall = writeInstallConfig({
+      vaultPath: resolvedNewVault,
+      dataPath: resolvedNewData,
+      operatorRoot: null,
+      configPath: null,
+      extra: {
+        restoredFromBackupId: manifest.backup_id,
+        ...(preservedRepoRoot ? { repoRoot: preservedRepoRoot } : {})
+      }
+    });
+    reboundConfig.installConfigManifestPath = writtenInstall.manifestPath;
+
+    const restoredAutoSyncCfgPath = path.join(resolvedNewData, 'manifests', 'auto-sync-config.json');
+    if (fs.existsSync(restoredAutoSyncCfgPath)) {
+      try {
+        const autoCfg = JSON.parse(fs.readFileSync(restoredAutoSyncCfgPath, 'utf8').replace(/^\uFEFF/, ''));
+        if (autoCfg && typeof autoCfg === 'object') {
+          autoCfg.vaultDir = resolvedNewVault;
+          autoCfg.dataDir = resolvedNewData;
+          autoCfg.restoredFromBackupId = manifest.backup_id;
+          fs.writeFileSync(restoredAutoSyncCfgPath, JSON.stringify(autoCfg, null, 2) + '\n', 'utf8');
+          reboundConfig.autoSyncConfigRebound = true;
+        }
+      } catch {
+        // preserve unreadable file untouched
+      }
+    }
+
+    const restoredPluginDir = path.join(resolvedNewVault, '.obsidian', 'plugins', 'mindloom');
+    const restoredPluginDataPath = path.join(restoredPluginDir, 'data.json');
+    const restoredCliCandidate = path.join(resolvedNewData, 'cli', 'mem.mjs');
+    const hasRestoredMindLoomPlugin =
+      fs.existsSync(path.join(restoredPluginDir, 'manifest.json')) ||
+      fs.existsSync(path.join(restoredPluginDir, 'main.js')) ||
+      fs.existsSync(restoredPluginDataPath);
+
+    if (fs.existsSync(restoredPluginDataPath)) {
+      try {
+        const pluginCfg = JSON.parse(fs.readFileSync(restoredPluginDataPath, 'utf8').replace(/^\uFEFF/, ''));
+        if (!pluginCfg || typeof pluginCfg !== 'object' || Array.isArray(pluginCfg)) {
+          throw new Error('data.json must be a JSON object');
+        }
+        pluginCfg.vaultPath = resolvedNewVault;
+        pluginCfg.dataPath = resolvedNewData;
+        if (fs.existsSync(restoredCliCandidate)) {
+          pluginCfg.cliPath = restoredCliCandidate;
+        } else if (pluginCfg.cliPath) {
+          pluginCfg.cliPath = remapPathPrefix(pluginCfg.cliPath, oldData, resolvedNewData);
+        }
+        fs.writeFileSync(restoredPluginDataPath, JSON.stringify(pluginCfg, null, 2) + '\n', 'utf8');
+        reboundConfig.pluginDataRebound = true;
+      } catch (err) {
+        reboundConfig.pluginBindingNote =
+          `Failed to update restored MindLoom plugin data.json (${err?.message || err}); configure Data Directory Path manually to: ${resolvedNewData}`;
+      }
+    } else if (hasRestoredMindLoomPlugin) {
+      try {
+        fs.mkdirSync(restoredPluginDir, { recursive: true });
+        const minimalPluginCfg = {
+          vaultPath: resolvedNewVault,
+          dataPath: resolvedNewData,
+          cliPath: fs.existsSync(restoredCliCandidate) ? restoredCliCandidate : '',
+          nodePath: '',
+          operatorRoot: '',
+          timeoutMs: 25000
+        };
+        fs.writeFileSync(restoredPluginDataPath, JSON.stringify(minimalPluginCfg, null, 2) + '\n', 'utf8');
+        reboundConfig.pluginDataRebound = true;
+        reboundConfig.pluginDataGenerated = true;
+      } catch (err) {
+        reboundConfig.pluginBindingNote =
+          `Failed to generate MindLoom plugin data.json (${err?.message || err}); configure Data Directory Path manually to: ${resolvedNewData}`;
+      }
+    } else {
+      reboundConfig.pluginBindingNote =
+        `MindLoom companion plugin is not present in restored Vault; if installed later, configure Data Directory Path to: ${resolvedNewData}`;
+    }
+
     return {
       restored: true,
       backupId: manifest.backup_id,
       newVaultPath: resolvedNewVault,
       newDataPath: resolvedNewData,
       instanceIdentity,
+      reboundConfig,
       cloudRestoreLock: {
         stateDbLock,
         operatorDbLock

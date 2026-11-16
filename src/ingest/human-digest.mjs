@@ -1,13 +1,65 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { parseRenderedSessionEvents } from '../distill/llm-distiller.mjs';
 import { parseMarkdownFrontmatter } from '../schema/frontmatter.mjs';
 import { assertVaultGitNoRemote, isWhitelistedVaultPath } from '../git/repo-manager.mjs';
 import { scanAndSyncNotes } from '../tombstone/tracker.mjs';
+import { findMarkdownFiles, readFrontmatterId } from '../storage/path-sanitizer.mjs';
+import { evaluateSanitizedVisibility } from '../security/privacy-gate.mjs';
 
 const DIGEST_HEADING = '## 人类精读摘要（对话要点与结论）';
 const EVENTS_HEADING = '## 会话事件记录';
+const GENERATED_MOC_PROJECT_MARKER = '<!-- mindloom-generated: moc-project v=1 -->';
+const GENERATED_MOC_DIGEST_MARKER = '<!-- mindloom-generated: moc-digest v=1 -->';
+const GENERATED_HOME_MARKER = '<!-- mindloom-generated: vault-home v=1 -->';
+
+function isMindLoomGeneratedProjectMoc(content) {
+  const text = String(content || '');
+  if (text.includes('<!-- mindloom-generated: moc-project')) {
+    return true;
+  }
+  return /^# .+ · 项目记忆地图 \(MOC\)\r?\n\r?\n> 自动生成于 \d{4}-\d{2}-\d{2}｜本页仅汇集 `privacy: sanitized` 公开合规条目/.test(
+    text.replace(/^\uFEFF/, '')
+  );
+}
+
+function isMindLoomGeneratedDigest(content) {
+  const text = String(content || '');
+  if (text.includes('<!-- mindloom-generated: moc-digest')) {
+    return true;
+  }
+  return /^# 学习简报 · 最新会话精华导读\r?\n\r?\n> 更新时间: \d{4}-\d{2}-\d{2}｜/.test(
+    text.replace(/^\uFEFF/, '')
+  );
+}
+
+function resolveSafeGeneratedMocTarget({ mocDir, baseSlug, suffix = '__mindloom-moc', isManagedFn, claimedFiles, hashSeed }) {
+  const shortHash = crypto.createHash('sha1').update(String(hashSeed || baseSlug), 'utf8').digest('hex').slice(0, 6);
+  const candidates = [
+    `${baseSlug}.md`,
+    `${baseSlug}${suffix}.md`,
+    `${baseSlug}${suffix}-${shortHash}.md`
+  ];
+  for (let i = 0; i < candidates.length; i++) {
+    const fileName = candidates[i];
+    if (claimedFiles.has(fileName)) continue;
+    const fullPath = path.join(mocDir, fileName);
+    if (!fs.existsSync(fullPath)) {
+      return { fileName, fullPath, conflictPreserved: i > 0 ? candidates[0] : null };
+    }
+    try {
+      const existingRaw = fs.readFileSync(fullPath, 'utf8');
+      if (isManagedFn(existingRaw)) {
+        return { fileName, fullPath, conflictPreserved: i > 0 ? candidates[0] : null };
+      }
+    } catch {
+      // preserve unreadable file untouched
+    }
+  }
+  return { fileName: null, fullPath: null, conflictPreserved: candidates[0] };
+}
 
 /**
  * 清洗会话文本中的包裹标签与系统上下文噪声，保留人类可读正文
@@ -177,6 +229,19 @@ function readVerifiedSanitizedMarkdown(filePath) {
   return { raw, frontmatter };
 }
 
+function collectVaultIdCounts(vaultDir) {
+  const counts = new Map();
+  for (const folder of ['10_Readable_Sessions', '20_Evidence_Cards', '30_Knowledge_Notes', '40_Review_Queue']) {
+    const dir = path.join(vaultDir, folder);
+    if (!fs.existsSync(dir)) continue;
+    for (const filePath of findMarkdownFiles(dir, { excludeTemplates: true, followSymlinks: false, boundaryDir: vaultDir })) {
+      const id = readFrontmatterId(filePath);
+      if (id) counts.set(id, (counts.get(id) || 0) + 1);
+    }
+  }
+  return counts;
+}
+
 /**
  * 重建 Obsidian `00_MOC/` 主题地图、`学习简报_最新会话精华.md` 与升级版 `首页.md`
  * 严格仅纳入 active + privacy === 'sanitized' 笔记，绝不泄露 local_only 标题或内容。
@@ -223,10 +288,19 @@ export function rebuildVaultMocAndHome({
     )
     .all();
 
+  const idCounts = collectVaultIdCounts(vaultDir);
   const verifiedNotes = [];
   for (const row of rows) {
     const checked = readVerifiedSanitizedMarkdown(row.path);
     if (!checked) continue;
+    const vis = evaluateSanitizedVisibility({
+      raw: checked.raw,
+      frontmatter: checked.frontmatter,
+      dbRow: row,
+      duplicateIdCount: row.id ? idCounts.get(row.id) || 0 : 0,
+      checkResidualSecrets: true
+    });
+    if (!vis.allowed) continue;
     const relNoExt = path.relative(vaultDir, row.path).replace(/\\/g, '/').replace(/\.md$/i, '');
     verifiedNotes.push({ ...row, relNoExt, raw: checked.raw });
   }
@@ -244,6 +318,8 @@ export function rebuildVaultMocAndHome({
   }
 
   const projectMocLinks = [];
+  const mocConflicts = [];
+  const claimedMocFiles = new Set(['学习简报_最新会话精华.md', '学习简报_最新会话精华__mindloom.md']);
   const sortedProjects = [...byProject.entries()].sort((a, b) => b[1].length - a[1].length);
 
   for (const [project, list] of sortedProjects) {
@@ -307,20 +383,49 @@ export function rebuildVaultMocAndHome({
       }
     }
 
-    const safeFile = `${toSafeFileSlug(project)}.md`;
-    const mocPath = path.join(mocDir, safeFile);
-    fs.writeFileSync(mocPath, lines.join('\n').trimEnd() + '\n', 'utf8');
-    touchedPaths.push(mocPath);
+    lines.push('', GENERATED_MOC_PROJECT_MARKER);
+
+    const resolvedTarget = resolveSafeGeneratedMocTarget({
+      mocDir,
+      baseSlug: toSafeFileSlug(project),
+      suffix: '__mindloom-moc',
+      isManagedFn: isMindLoomGeneratedProjectMoc,
+      claimedFiles: claimedMocFiles,
+      hashSeed: project
+    });
+    if (!resolvedTarget.fullPath) {
+      mocConflicts.push({
+        type: 'project_moc',
+        project,
+        handwrittenFile: `00_MOC/${resolvedTarget.conflictPreserved}`,
+        resolvedFile: null,
+        skippedDueToConflict: true
+      });
+      continue;
+    }
+    if (resolvedTarget.conflictPreserved) {
+      mocConflicts.push({
+        type: 'project_moc',
+        project,
+        handwrittenFile: `00_MOC/${resolvedTarget.conflictPreserved}`,
+        resolvedFile: `00_MOC/${resolvedTarget.fileName}`,
+        skippedDueToConflict: false
+      });
+    }
+    claimedMocFiles.add(resolvedTarget.fileName);
+    fs.writeFileSync(resolvedTarget.fullPath, lines.join('\n').trimEnd() + '\n', 'utf8');
+    touchedPaths.push(resolvedTarget.fullPath);
     projectMocLinks.push({
       project,
-      relPath: `00_MOC/${safeFile}`,
+      fileName: resolvedTarget.fileName,
+      relPath: `00_MOC/${resolvedTarget.fileName}`,
       knowledgeCount: knowledge.length,
       evidenceCount: evidence.length,
       sessionsCount: sessions.length
     });
   }
 
-  // 全局学习简报：最新会话精华
+  // 全局学习简报：最新会话精华（同样保护同名手写文件）
   const allSessions = verifiedNotes.filter((n) => n.note_type === 'session');
   const pendingProps = verifiedNotes.filter((n) => n.note_type === 'proposal' && /proposal_status:\s*"?pending"?/i.test(n.raw));
   const digestLines = [
@@ -346,9 +451,60 @@ export function rebuildVaultMocAndHome({
     digestLines.push('');
   }
 
-  const digestPath = path.join(mocDir, '学习简报_最新会话精华.md');
-  fs.writeFileSync(digestPath, digestLines.join('\n').trimEnd() + '\n', 'utf8');
-  touchedPaths.push(digestPath);
+  const digestClaimed = new Set(projectMocLinks.map((pm) => pm.fileName));
+  const digestResolved = resolveSafeGeneratedMocTarget({
+    mocDir,
+    baseSlug: '学习简报_最新会话精华',
+    suffix: '__mindloom',
+    isManagedFn: isMindLoomGeneratedDigest,
+    claimedFiles: digestClaimed,
+    hashSeed: 'digest-brief'
+  });
+  let digestPath = null;
+  let digestRelNoExt = null;
+  if (digestResolved.fullPath) {
+    if (digestResolved.conflictPreserved) {
+      mocConflicts.push({
+        type: 'digest_brief',
+        handwrittenFile: `00_MOC/${digestResolved.conflictPreserved}`,
+        resolvedFile: `00_MOC/${digestResolved.fileName}`,
+        skippedDueToConflict: false
+      });
+    }
+    digestPath = digestResolved.fullPath;
+    digestRelNoExt = `00_MOC/${digestResolved.fileName.replace(/\.md$/i, '')}`;
+    digestLines.push(GENERATED_MOC_DIGEST_MARKER);
+    fs.writeFileSync(digestPath, digestLines.join('\n').trimEnd() + '\n', 'utf8');
+    touchedPaths.push(digestPath);
+  } else {
+    mocConflicts.push({
+      type: 'digest_brief',
+      handwrittenFile: `00_MOC/${digestResolved.conflictPreserved}`,
+      resolvedFile: null,
+      skippedDueToConflict: true
+    });
+  }
+
+  // 同步撤回不再包含任何 active + sanitized 条目的旧自动生成项目 MOC 页（绝不触碰用户手写文件）
+  const activeProjectFiles = new Set(projectMocLinks.map((pm) => pm.fileName));
+  const activeDigestFile = digestResolved.fileName || '';
+  const withdrawnMocs = [];
+  if (fs.existsSync(mocDir)) {
+    for (const entry of fs.readdirSync(mocDir, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.toLowerCase().endsWith('.md')) continue;
+      if (entry.name === activeDigestFile || activeProjectFiles.has(entry.name)) continue;
+      const candidatePath = path.join(mocDir, entry.name);
+      try {
+        const candidateRaw = fs.readFileSync(candidatePath, 'utf8');
+        if (isMindLoomGeneratedProjectMoc(candidateRaw) || isMindLoomGeneratedDigest(candidateRaw)) {
+          fs.unlinkSync(candidatePath);
+          withdrawnMocs.push(`00_MOC/${entry.name}`);
+        }
+      } catch {
+        // ignore unreadable candidate
+      }
+    }
+  }
 
   // 升级版 首页.md
   const homeLines = [
@@ -356,10 +512,16 @@ export function rebuildVaultMocAndHome({
     '',
     `> 本地原生记忆库（零社区插件 · 双目录安全隔离 · 最近导航同步: ${nowIso.slice(0, 10)}）`,
     '',
-    '## 一、学习导读与项目知识地图 (MOC)',
-    '- 🌟 **[[00_MOC/学习简报_最新会话精华|最新会话学习简报（已过滤工具日志）]]** — 先看这里快速吸收近期对话精华',
-    ''
+    '## 一、学习导读与项目知识地图 (MOC)'
   ];
+  if (digestRelNoExt) {
+    homeLines.push(
+      `- 🌟 **[[${digestRelNoExt}|最新会话学习简报（已过滤工具日志）]]** — 先看这里快速吸收近期对话精华`,
+      ''
+    );
+  } else {
+    homeLines.push('');
+  }
   for (const pm of projectMocLinks) {
     homeLines.push(
       `- 📂 **[[${pm.relPath.replace(/\.md$/i, '')}|${pm.project}]]**（知识 ${pm.knowledgeCount} · 证据 ${pm.evidenceCount} · 会话 ${pm.sessionsCount}）`
@@ -384,6 +546,8 @@ export function rebuildVaultMocAndHome({
     ''
   );
 
+  homeLines.push(GENERATED_HOME_MARKER, '');
+
   const homePath = path.join(vaultDir, '首页.md');
   fs.writeFileSync(homePath, homeLines.join('\n'), 'utf8');
   touchedPaths.push(homePath);
@@ -397,9 +561,15 @@ export function rebuildVaultMocAndHome({
         relToAdd.push(path.relative(vaultDir, p).replace(/\\/g, '/'));
       }
     }
-    if (relToAdd.length > 0) {
+    const relWithdrawn = withdrawnMocs.filter((rel) => isWhitelistedVaultPath(vaultDir, path.join(vaultDir, rel)));
+    if (relToAdd.length > 0 || relWithdrawn.length > 0) {
       try {
-        execFileSync('git', ['add', '--', ...relToAdd], { cwd: vaultDir, stdio: ['pipe', 'pipe', 'pipe'] });
+        if (relToAdd.length > 0) {
+          execFileSync('git', ['add', '--', ...relToAdd], { cwd: vaultDir, stdio: ['pipe', 'pipe', 'pipe'] });
+        }
+        if (relWithdrawn.length > 0) {
+          execFileSync('git', ['add', '-A', '--', ...relWithdrawn], { cwd: vaultDir, stdio: ['pipe', 'pipe', 'pipe'] });
+        }
         const staged = execFileSync('git', ['diff', '--cached', '--name-only'], {
           cwd: vaultDir,
           encoding: 'utf8',
@@ -425,6 +595,8 @@ export function rebuildVaultMocAndHome({
     projectsCount: projectMocLinks.length,
     sanitizedNotesCount: verifiedNotes.length,
     projectMocs: projectMocLinks,
+    withdrawnMocs,
+    mocConflicts,
     digestPath,
     homePath,
     gitState

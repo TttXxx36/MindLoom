@@ -106,9 +106,14 @@ node cli/mem.mjs auto-sync --dry-run --json         # 预览白名单增量同�
 node cli/mem.mjs render-moc --update-digests        # 重建 00_MOC/ 与学习简报
 node cli/mem.mjs search "401" --mode literal        # Mode 0 离线精确检索
 node cli/mem.mjs reconcile                          # 同步改名/缺失并核对提案
-node cli/mem.mjs restore <ID> --revision rev-0001   # 预览或追加 --confirm 原子恢复
+node cli/mem.mjs recover-publish                    # 恢复未决 linking 或已落盘漏登记 notes 意图
+node cli/mem.mjs restore <ID> --revision rev-0001   # 预览或追加 --confirm 单篇原子恢复
 node cli/mem.mjs backup --target /path/to/backups   # WAL 检查点一致备份
+node cli/mem.mjs restore-backup --backup <dir> --vault <new-v> --data <new-d> [--switch]
+node cli/mem.mjs use --vault <v> --data <d>         # 显式切换全局默认 Vault/Data 实例
 ```
+
+关于隔离等级支持矩阵、Source of Truth 权责划分及“撤回 vs 彻底清除”语义，请参阅 [支持矩阵与生命周期边界](docs/SUPPORT_MATRIX.md)。
 
 ---
 
