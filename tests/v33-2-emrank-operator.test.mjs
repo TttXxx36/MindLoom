@@ -15,7 +15,8 @@ import { emrankAdapter } from '../src/providers/adapters/emrank.mjs';
 import {
   buildOperatorIsolationTargets,
   verifyElevatedWindowsOperatorAclIsolation,
-  runFourPointCloudIsolationSentinel
+  runFourPointCloudIsolationSentinel,
+  isCurrentWindowsProcessElevated
 } from '../src/security/isolation-sentinel.mjs';
 import {
   EMRANK_DEFAULT_MODEL_ID,
@@ -273,10 +274,14 @@ Write-Output 'AST_OK'
     assert.equal(cliFlagFailed, true);
 
     let unlockedSentinelFailed = false;
+    const sentinelArgs = [path.resolve('cli/mem-operator.mjs'), 'sentinel-check', '--operator-root', tmpRoot, '--json'];
+    if (isCurrentWindowsProcessElevated()) {
+      sentinelArgs.push('--allow-elevated');
+    }
     try {
       execFileSync(
         process.execPath,
-        [path.resolve('cli/mem-operator.mjs'), 'sentinel-check', '--operator-root', tmpRoot, '--json'],
+        sentinelArgs,
         { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
       );
     } catch (err) {

@@ -17,19 +17,6 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-if ([string]::IsNullOrWhiteSpace($DataDir)) {
-  if ($env:MINDLOOM_DATA) { $DataDir = $env:MINDLOOM_DATA }
-  elseif ($env:AGENT_MEMORY_DATA) { $DataDir = $env:AGENT_MEMORY_DATA }
-  else {
-    $cfgFile = Join-Path $HOME ".mindloom\config.json"
-    if (Test-Path -LiteralPath $cfgFile) {
-      try { $DataDir = ((Get-Content -LiteralPath $cfgFile -Raw -Encoding utf8) | ConvertFrom-Json).dataPath } catch {}
-    }
-    if ([string]::IsNullOrWhiteSpace($DataDir)) {
-      $DataDir = Join-Path ([Environment]::GetFolderPath('MyDocuments')) "Obsidian\MindLoom-Data"
-    }
-  }
-}
 
 # 1. Refuse non-interactive or known automated agent execution environments
 $isInputRedirected = $false
@@ -62,6 +49,22 @@ if (
 ) {
   Write-Error "ACCESS_DENIED (EXIT 43): approve-ingest-human.ps1 is restricted to interactive human terminals only." -ErrorAction Continue
   exit 43
+}
+
+if ([string]::IsNullOrWhiteSpace($DataDir)) {
+  if ($env:MINDLOOM_DATA) { $DataDir = $env:MINDLOOM_DATA }
+  elseif ($env:AGENT_MEMORY_DATA) { $DataDir = $env:AGENT_MEMORY_DATA }
+  else {
+    $cfgFile = Join-Path $HOME ".mindloom\config.json"
+    if (Test-Path -LiteralPath $cfgFile) {
+      try { $DataDir = ((Get-Content -LiteralPath $cfgFile -Raw -Encoding utf8) | ConvertFrom-Json).dataPath } catch {}
+    }
+    if ([string]::IsNullOrWhiteSpace($DataDir)) {
+      $docsDir = [Environment]::GetFolderPath('MyDocuments')
+      if ([string]::IsNullOrWhiteSpace($docsDir)) { $docsDir = Join-Path $HOME "Documents" }
+      $DataDir = Join-Path $docsDir "Obsidian\MindLoom-Data"
+    }
+  }
 }
 
 $resolvedDataDir = [System.IO.Path]::GetFullPath($DataDir)

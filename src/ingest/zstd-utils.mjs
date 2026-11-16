@@ -196,6 +196,103 @@ const SHARED_ZSTD_IN_BUF = Buffer.allocUnsafe(ZSTD_STREAM_CHUNK_BYTES);
 const SHARED_ZSTD_OUT_BUF = Buffer.allocUnsafe(ZSTD_STREAM_OUT_BYTES);
 let sharedZstdBuffersInUse = false;
 
+function verifyZstdFrameStructureSync(fd, size) {
+  const readAt = (pos, len) => {
+    const buf = Buffer.allocUnsafe(len);
+    let readTotal = 0;
+    while (readTotal < len) {
+      const n = fs.readSync(fd, buf, readTotal, len - readTotal, pos + readTotal);
+      if (n <= 0) break;
+      readTotal += n;
+    }
+    if (readTotal < len) {
+      throw new Error(`Unexpected EOF reading ${len} bytes at offset ${pos}`);
+    }
+    return buf;
+  };
+
+  let offset = 0;
+  let lastDataFrameStart = -1;
+  let lastDataFrameEnd = -1;
+  while (offset < size) {
+    if (offset + 4 > size) {
+      throw new Error(`Truncated zstd frame header at byte offset ${offset}`);
+    }
+    const magic = readAt(offset, 4).readUInt32LE(0);
+
+    if (magic >= ZSTD_SKIPPABLE_MAGIC_MIN && magic <= ZSTD_SKIPPABLE_MAGIC_MAX) {
+      if (offset + 8 > size) {
+        throw new Error(`Truncated skippable zstd frame header at byte offset ${offset}`);
+      }
+      const skipSize = readAt(offset + 4, 4).readUInt32LE(0);
+      const nextOffset = offset + 8 + skipSize;
+      if (nextOffset > size) {
+        throw new Error(`Truncated skippable zstd frame payload at byte offset ${offset}`);
+      }
+      offset = nextOffset;
+      continue;
+    }
+
+    if (magic !== ZSTD_FRAME_MAGIC_LE) {
+      throw new Error(`Invalid zstd frame magic 0x${magic.toString(16)} at byte offset ${offset}`);
+    }
+    if (offset + 5 > size) {
+      throw new Error(`Truncated zstd frame header descriptor at byte offset ${offset}`);
+    }
+
+    const fhd = readAt(offset + 4, 1)[0];
+    const fcsFlag = (fhd >> 6) & 0x03;
+    const singleSegment = (fhd >> 5) & 0x01;
+    const checksumFlag = (fhd >> 2) & 0x01;
+    const dictIdFlag = fhd & 0x03;
+
+    const winBytes = singleSegment ? 0 : 1;
+    const dictBytes = [0, 1, 2, 4][dictIdFlag];
+    const fcsBytes = fcsFlag === 0 ? (singleSegment ? 1 : 0) : [0, 2, 4, 8][fcsFlag];
+
+    let pos = offset + 5 + winBytes + dictBytes + fcsBytes;
+    if (pos > size) {
+      throw new Error(`Truncated zstd frame header fields at byte offset ${offset}`);
+    }
+
+    let lastBlock = 0;
+    while (!lastBlock) {
+      if (pos + 3 > size) {
+        throw new Error(`Truncated zstd block header at byte offset ${pos}`);
+      }
+      const bhBuf = readAt(pos, 3);
+      const bh = bhBuf[0] | (bhBuf[1] << 8) | (bhBuf[2] << 16);
+      pos += 3;
+      lastBlock = bh & 0x01;
+      const blockType = (bh >> 1) & 0x03;
+      const blockSize = bh >> 3;
+      if (blockType === 3) {
+        throw new Error(`Corrupt zstd block (reserved block type 3) at byte offset ${pos - 3}`);
+      }
+      const payloadBytes = blockType === 1 ? 1 : blockSize;
+      if (pos + payloadBytes > size) {
+        throw new Error(`Truncated zstd block payload at byte offset ${pos}`);
+      }
+      pos += payloadBytes;
+    }
+
+    if (checksumFlag) {
+      if (pos + 4 > size) {
+        throw new Error(`Truncated zstd content checksum at byte offset ${pos}`);
+      }
+      pos += 4;
+    }
+
+    lastDataFrameStart = offset;
+    lastDataFrameEnd = pos;
+    offset = pos;
+  }
+
+  if (lastDataFrameStart >= 0 && lastDataFrameEnd - lastDataFrameStart <= 2 * 1024 * 1024) {
+    zlib.zstdDecompressSync(readAt(lastDataFrameStart, lastDataFrameEnd - lastDataFrameStart));
+  }
+}
+
 function readZstdPrefixLinesByFramesFallback(fd, size, maxLines) {
   const readAt = (pos, len) => {
     const buf = Buffer.allocUnsafe(len);
@@ -501,6 +598,10 @@ export function readZstdPrefixLinesFromFile(filePath, maxLines = 4, existingStat
             lines.push(tailStr);
           }
         }
+      }
+
+      if (!stoppedEarly && !hitScanCap) {
+        verifyZstdFrameStructureSync(fd, size);
       }
 
       return {

@@ -16,11 +16,6 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-if ([string]::IsNullOrWhiteSpace($DataDir)) {
-  if ($env:MINDLOOM_DATA) { $DataDir = $env:MINDLOOM_DATA }
-  elseif ($env:AGENT_MEMORY_DATA) { $DataDir = $env:AGENT_MEMORY_DATA }
-  else { $DataDir = Join-Path ([Environment]::GetFolderPath('MyDocuments')) "Obsidian\MindLoom-Data" }
-}
 
 # 1. Refuse non-interactive or known automated agent execution environments
 $isInputRedirected = $false
@@ -53,6 +48,16 @@ if (
 ) {
   Write-Error "ACCESS_DENIED (EXIT 43): inspect-raw-local.ps1 is restricted to interactive human terminals only." -ErrorAction Continue
   exit 43
+}
+
+if ([string]::IsNullOrWhiteSpace($DataDir)) {
+  if ($env:MINDLOOM_DATA) { $DataDir = $env:MINDLOOM_DATA }
+  elseif ($env:AGENT_MEMORY_DATA) { $DataDir = $env:AGENT_MEMORY_DATA }
+  else {
+    $docsDir = [Environment]::GetFolderPath('MyDocuments')
+    if ([string]::IsNullOrWhiteSpace($docsDir)) { $docsDir = Join-Path $HOME "Documents" }
+    $DataDir = Join-Path $docsDir "Obsidian\MindLoom-Data"
+  }
 }
 
 # 2. Restrict lexical target path inside DataDir\raw BEFORE interactive confirmation prompt

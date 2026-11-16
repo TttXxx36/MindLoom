@@ -24,17 +24,19 @@ $cfgObj = $null
 if (Test-Path -LiteralPath $cfgFile) {
   try { $cfgObj = (Get-Content -LiteralPath $cfgFile -Raw -Encoding utf8) | ConvertFrom-Json } catch {}
 }
+$docsDir = [Environment]::GetFolderPath('MyDocuments')
+if ([string]::IsNullOrWhiteSpace($docsDir)) { $docsDir = Join-Path $HOME "Documents" }
 if ([string]::IsNullOrWhiteSpace($VaultDir)) {
   if ($env:MINDLOOM_VAULT) { $VaultDir = $env:MINDLOOM_VAULT }
   elseif ($env:AGENT_MEMORY_VAULT) { $VaultDir = $env:AGENT_MEMORY_VAULT }
   elseif ($cfgObj -and $cfgObj.vaultPath) { $VaultDir = $cfgObj.vaultPath }
-  else { $VaultDir = Join-Path ([Environment]::GetFolderPath('MyDocuments')) "Obsidian\MindLoom" }
+  else { $VaultDir = Join-Path $docsDir "Obsidian\MindLoom" }
 }
 if ([string]::IsNullOrWhiteSpace($DataDir)) {
   if ($env:MINDLOOM_DATA) { $DataDir = $env:MINDLOOM_DATA }
   elseif ($env:AGENT_MEMORY_DATA) { $DataDir = $env:AGENT_MEMORY_DATA }
   elseif ($cfgObj -and $cfgObj.dataPath) { $DataDir = $cfgObj.dataPath }
-  else { $DataDir = Join-Path ([Environment]::GetFolderPath('MyDocuments')) "Obsidian\MindLoom-Data" }
+  else { $DataDir = Join-Path $docsDir "Obsidian\MindLoom-Data" }
 }
 
 $resolvedVault = [System.IO.Path]::GetFullPath($VaultDir)

@@ -83,6 +83,18 @@ export function initGitRepo(vaultDir) {
     execFileSync('git', ['init'], { cwd: vaultDir });
   }
   execFileSync('git', ['config', 'core.quotepath', 'false'], { cwd: vaultDir });
+  try {
+    const name = execFileSync('git', ['config', 'user.name'], { cwd: vaultDir, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+    if (!name) throw new Error('empty');
+  } catch {
+    execFileSync('git', ['config', 'user.name', 'MindLoom'], { cwd: vaultDir });
+  }
+  try {
+    const email = execFileSync('git', ['config', 'user.email'], { cwd: vaultDir, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+    if (!email) throw new Error('empty');
+  } catch {
+    execFileSync('git', ['config', 'user.email', 'mindloom@local.invalid'], { cwd: vaultDir });
+  }
 }
 
 /**

@@ -18,6 +18,7 @@ import {
 } from '../src/distill/llm-distiller.mjs';
 import { issueTrustedLowSensitivityApproval } from '../src/security/trusted-approvals.mjs';
 import { validateEngineeringCommitPaths } from '../src/git/repo-manager.mjs';
+import { isCurrentWindowsProcessElevated } from '../src/security/isolation-sentinel.mjs';
 
 const MEM_CLI_PATH = path.resolve('cli/mem.mjs');
 const OPERATOR_CLI_PATH = path.resolve('cli/mem-operator.mjs');
@@ -428,14 +429,17 @@ Qwen3-Embedding-0.6B 在真实测试集上达成 Hit@1 100%，首篇延迟降低
     assert.notEqual(locDistill.status, 0);
     assert.match(`${locDistill.stderr || ''}\n${locDistill.stdout || ''}`, /ERR_DISTILL_PRIVACY_NOT_SANITIZED/);
 
-    // mem-operator distill recognized & enforces elevation gate in ordinary host
+    // mem-operator distill recognized & enforces elevation / OS isolation gates
     const opDistill = spawnSync(
       process.execPath,
       [OPERATOR_CLI_PATH, 'distill', '--session', sanitizedSessId, '--approval', 'CEGR-test-only'],
       { env, encoding: 'utf8' }
     );
     assert.notEqual(opDistill.status, 0);
-    assert.match(`${opDistill.stderr || ''}\n${opDistill.stdout || ''}`, /ERR_OPERATOR_ELEVATION_REQUIRED/);
+    const expectedOpPattern = isCurrentWindowsProcessElevated()
+      ? /ERR_CLOUD_OS_ISOLATION_FAILED/
+      : /ERR_OPERATOR_ELEVATION_REQUIRED/;
+    assert.match(`${opDistill.stderr || ''}\n${opDistill.stdout || ''}`, expectedOpPattern);
   });
 
   await t.test('4. PowerShell auto-sync scripts AST parse, register-auto-sync-task EXIT 43 guard, and Gate-1 whitelist check', () => {
