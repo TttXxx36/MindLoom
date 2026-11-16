@@ -1,0 +1,74 @@
+name: MindLoom CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  leak-guard:
+    name: Privacy, Secret & Script Syntax Guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Run personal-path, secret & plugin-boundary leak scan
+        run: node scripts/check-leaks.mjs
+      - name: Validate bash installer syntax
+        run: bash -n scripts/install.sh
+
+  test-matrix:
+    name: Test (${{ matrix.os }} / Node ${{ matrix.node-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node-version: ['22', '24']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Install plugin devDependencies
+        run: npm --prefix plugin install --no-audit --no-fund
+      - name: Run full Node test suite
+        run: npm test
+      - name: Validate PowerShell AST (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path "scripts","cli" -Filter "*.ps1" | ForEach-Object {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errors)
+            if ($errors -and $errors.Count -gt 0) { throw ($errors | Out-String) }
+          }
+
+  plugin-build:
+    name: Companion Plugin Typecheck & Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install plugin dependencies
+        run: npm --prefix plugin install --no-audit --no-fund
+      - name: Typecheck plugin
+        run: npm run plugin:typecheck
+      - name: Build plugin bundle
+        run: npm run plugin:build
+      - name: Verify bundle size (< 150 KB) and artifacts
+        run: |
+          node -e "
+            const fs = require('node:fs');
+            for (const f of ['plugin/dist/main.js', 'plugin/dist/manifest.json', 'plugin/dist/styles.css']) {
+              if (!fs.existsSync(f)) throw new Error('Missing artifact: ' + f);
+            }
+            const bytes = fs.statSync('plugin/dist/main.js').size;
+            console.log('main.js bytes:', bytes);
+            if (bytes >= 153600) throw new Error('Bundle exceeded 150KB: ' + bytes);
+          "

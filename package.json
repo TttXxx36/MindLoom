@@ -1,0 +1,60 @@
+{
+  "name": "mindloom",
+  "version": "1.0.0",
+  "description": "MindLoom — Local-first Agent × Obsidian memory vault CLI, cross-platform setup wizard, and companion console plugin.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TttXxx36/MindLoom.git"
+  },
+  "homepage": "https://github.com/TttXxx36/MindLoom#readme",
+  "bugs": {
+    "url": "https://github.com/TttXxx36/MindLoom/issues"
+  },
+  "keywords": [
+    "obsidian",
+    "ai-agent",
+    "memory",
+    "codex",
+    "antigravity",
+    "knowledge-base",
+    "local-first",
+    "sqlite"
+  ],
+  "bin": {
+    "mindloom": "./cli/mem.mjs",
+    "mem": "./cli/mem.mjs",
+    "mindloom-operator": "./cli/mem-operator.mjs"
+  },
+  "files": [
+    "cli/",
+    "src/",
+    "scripts/",
+    "plugin/dist/",
+    "plugin/manifest.json",
+    "plugin/styles.css",
+    "LICENSE",
+    "README.md",
+    "README.zh-CN.md",
+    ".env.example"
+  ],
+  "scripts": {
+    "setup": "node cli/mem.mjs setup",
+    "test": "node --test \"tests/**/*.test.mjs\"",
+    "test:a01": "node --test tests/a01-schema-and-views.test.mjs",
+    "test:a02": "node --test tests/a02-proposal-reconcile.test.mjs",
+    "test:a03": "node --test tests/a03-collision-disambiguation.test.mjs",
+    "test:a04": "node --test tests/a04-publish-writeability.test.mjs",
+    "test:a05": "node --test tests/a05-whitelist-git.test.mjs",
+    "test:a06": "node --test tests/a06-tombstones-and-restore.test.mjs",
+    "plugin:build": "npm --prefix plugin run build",
+    "plugin:typecheck": "npm --prefix plugin run typecheck",
+    "lint:leaks": "node scripts/check-leaks.mjs",
+    "deploy:dry-run": "node cli/deploy.mjs --dry-run",
+    "deploy": "node cli/deploy.mjs --apply"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

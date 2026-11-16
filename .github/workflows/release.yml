@@ -1,0 +1,41 @@
+name: Release MindLoom & Obsidian Plugin
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Run leak scan & tests
+        run: |
+          node scripts/check-leaks.mjs
+          npm test
+      - name: Build Obsidian companion plugin
+        run: |
+          npm --prefix plugin install --no-audit --no-fund
+          npm run plugin:typecheck
+          npm run plugin:build
+      - name: Package BRAT-compatible plugin zip
+        run: |
+          mkdir -p release-assets
+          cp plugin/dist/main.js plugin/dist/manifest.json plugin/dist/styles.css release-assets/
+          (cd plugin/dist && zip -r ../../release-assets/mindloom-obsidian-plugin.zip main.js manifest.json styles.css)
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-assets/main.js
+            release-assets/manifest.json
+            release-assets/styles.css
+            release-assets/mindloom-obsidian-plugin.zip
+          generate_release_notes: true

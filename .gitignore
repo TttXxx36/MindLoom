@@ -1,0 +1,44 @@
+# Secrets & Environment
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+plugin/node_modules/
+
+# Local-only Private Session Data & Runtime State (NEVER commit to remote)
+/MindLoom/
+/MindLoom-Data/
+/AgentMemory/
+/AgentMemory-Data/
+/raw/
+/attachments/
+/manifests/
+/staging/
+/egress/
+/runtime/
+/.answer-me-with-html/
+/.tmp/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.jsonl
+*.jsonl.zst
+*.jsonl.zstd
+*.zst
+*.zstd
+*local_only*
+
+# Obsidian Ephemeral UI State
+.obsidian/workspace.json
+.obsidian/workspace-mobile.json
+.obsidian/cache
+.trash/
+
+# OS & Temp
+.DS_Store
+Thumbs.db
+*.tmp
+*.bak

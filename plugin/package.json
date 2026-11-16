@@ -1,0 +1,23 @@
+{
+  "name": "mindloom-obsidian-plugin",
+  "version": "1.0.0",
+  "description": "MindLoom companion console plugin for Obsidian",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "node esbuild.config.mjs production",
+    "dev": "node esbuild.config.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "obsidian",
+    "mindloom",
+    "agent-memory"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "esbuild": "^0.24.2",
+    "obsidian": "^1.7.2",
+    "typescript": "^5.7.2"
+  }
+}
