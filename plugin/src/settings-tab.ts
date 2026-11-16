@@ -16,7 +16,7 @@ export class MindLoomSettingTab extends PluginSettingTab {
     containerEl.createEl('h2', { text: 'MindLoom Companion Console Settings' });
     containerEl.createEl('p', {
       cls: 'mindloom-muted',
-      text: 'All database and file operations execute via the isolated Node >= 22 CLI. This plugin never reads API keys or privileged operator databases directly.'
+      text: 'All database and file operations execute via the isolated Node.js CLI (Node 22 LTS >= 22.15.0 or Node 24+). This plugin never reads API keys or privileged operator databases directly.'
     });
 
     new Setting(containerEl)
@@ -46,7 +46,7 @@ export class MindLoomSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName('Node.js (>= 22) Executable')
+      .setName('Node.js (22.15+ / 24+) Executable')
       .setDesc('Leave empty to auto-locate system node.')
       .addText((t) =>
         t

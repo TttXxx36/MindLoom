@@ -82,6 +82,18 @@ if (-not (Test-Path -LiteralPath $stateDbPath)) {
   exit 45
 }
 
+$schedulerMod = Join-Path (Split-Path $PSScriptRoot -Parent) "src\schedule\scheduler.mjs"
+if (-not (Test-Path -LiteralPath $schedulerMod)) {
+  $schedulerMod = Join-Path $resolvedData "cli\src\schedule\scheduler.mjs"
+}
+if ((-not $PSBoundParameters.ContainsKey('TaskName') -or [string]::IsNullOrWhiteSpace($TaskName)) -and (Test-Path -LiteralPath $schedulerMod)) {
+  $modUrl = ([Uri]$schedulerMod).AbsoluteUri
+  $computedName = (& node -e "import('$modUrl').then(m => console.log(m.resolveSchedulerNames({ vaultDir: process.argv[1], dataDir: process.argv[2] }).taskName))" $resolvedVault $resolvedData) | Out-String
+  if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($computedName)) {
+    $TaskName = $computedName.Trim()
+  }
+}
+
 $issueHelper = Join-Path $PSScriptRoot "issue-ingest-approval-internal.mjs"
 $runnerScript = Join-Path $PSScriptRoot "auto-sync-memory.ps1"
 if (-not (Test-Path -LiteralPath $issueHelper) -or -not (Test-Path -LiteralPath $runnerScript)) {
@@ -168,6 +180,21 @@ if (-not $SkipTaskRegistration) {
 
   Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $triggers -Settings $settings -Description "Obsidian Agent Memory whitelist low-sensitivity auto-sync (Codex + Antigravity, DSH excluded)" -Force | Out-Null
   Write-Host "Registered Windows Scheduled Task: '$TaskName' at $($Times -join ', ')" -ForegroundColor Green
+
+  if ($TaskName -ne "MindLoom AutoSync" -and (Test-Path -LiteralPath $schedulerMod)) {
+    $modUrl = ([Uri]$schedulerMod).AbsoluteUri
+    $migJson = (& node -e "import('$modUrl').then(m => console.log(JSON.stringify(m.migrateLegacyScheduleIfSameInstance({ platform: 'win32', vaultDir: process.argv[1], dataDir: process.argv[2], dryRun: false }))))" $resolvedVault $resolvedData) | Out-String
+    if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($migJson)) {
+      try {
+        $mig = $migJson | ConvertFrom-Json
+        if ($mig.migrated) {
+          Write-Host "Migrated legacy fixed-name task 'MindLoom AutoSync' -> '$TaskName'." -ForegroundColor Yellow
+        } elseif ($mig.found -and -not $mig.sameInstance) {
+          Write-Host "Notice: Legacy task 'MindLoom AutoSync' belongs to another vault and was preserved untouched." -ForegroundColor Yellow
+        }
+      } catch {}
+    }
+  }
 }
 
 Write-Host ""

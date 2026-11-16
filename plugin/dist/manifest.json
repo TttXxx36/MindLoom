@@ -1,7 +1,7 @@
 {
   "id": "mindloom",
   "name": "MindLoom",
-  "version": "1.0.0",
+  "version": "1.0.1-beta.1",
   "minAppVersion": "1.5.0",
   "description": "Companion console for MindLoom: quick memory search with ^event anchors, proposal diffs, tombstone restore, project whitelist editor, and read-only cloud budget viewer.",
   "author": "MindLoom Contributors",

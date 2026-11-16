@@ -27,14 +27,14 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        node-version: ['22', '24']
+        node-version: ['22.15.0', '22', '24']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
       - name: Install plugin devDependencies
-        run: npm --prefix plugin install --no-audit --no-fund
+        run: npm --prefix plugin ci --no-audit --no-fund
       - name: Run full Node test suite
         run: npm test
       - name: Validate PowerShell AST (Windows)
@@ -56,19 +56,17 @@ jobs:
         with:
           node-version: '22'
       - name: Install plugin dependencies
-        run: npm --prefix plugin install --no-audit --no-fund
+        run: npm --prefix plugin ci --no-audit --no-fund
       - name: Typecheck plugin
         run: npm run plugin:typecheck
       - name: Build plugin bundle
         run: npm run plugin:build
-      - name: Verify bundle size (< 150 KB) and artifacts
+      - name: Verify release assets & dry-run BRAT package
         run: |
-          node -e "
-            const fs = require('node:fs');
-            for (const f of ['plugin/dist/main.js', 'plugin/dist/manifest.json', 'plugin/dist/styles.css']) {
-              if (!fs.existsSync(f)) throw new Error('Missing artifact: ' + f);
-            }
-            const bytes = fs.statSync('plugin/dist/main.js').size;
-            console.log('main.js bytes:', bytes);
-            if (bytes >= 153600) throw new Error('Bundle exceeded 150KB: ' + bytes);
-          "
+          node scripts/verify-release-assets.mjs
+          mkdir -p release-assets
+          cp plugin/dist/main.js plugin/dist/manifest.json plugin/dist/styles.css release-assets/
+          (cd plugin/dist && zip -r ../../release-assets/mindloom-obsidian-plugin.zip main.js manifest.json styles.css)
+          for f in release-assets/main.js release-assets/manifest.json release-assets/styles.css release-assets/mindloom-obsidian-plugin.zip; do
+            test -s "$f" || (echo "Missing or empty asset: $f" && exit 1)
+          done

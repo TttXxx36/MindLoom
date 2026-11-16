@@ -2,6 +2,57 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+export const MIN_NODE_VERSION = Object.freeze({ major: 22, minor: 15, patch: 0, label: '22.15.0' });
+
+export function isNodeVersionSupported(versionStr = process.versions.node) {
+  const parts = String(versionStr || '')
+    .replace(/^v/i, '')
+    .split('.')
+    .map((n) => Number.parseInt(n, 10));
+  const major = Number.isFinite(parts[0]) ? parts[0] : 0;
+  const minor = Number.isFinite(parts[1]) ? parts[1] : 0;
+  if (major >= 24) return true;
+  if (major === 23) return minor >= 8;
+  if (major === 22) return minor >= 15;
+  return false;
+}
+
+export function resolveCanonicalPath(targetPath, { preserveCase = false } = {}) {
+  const resolved = path.resolve(String(targetPath || ''));
+  const segments = [];
+  let cur = resolved;
+  while (!fs.existsSync(cur)) {
+    const parent = path.dirname(cur);
+    if (parent === cur) break;
+    segments.unshift(path.basename(cur));
+    cur = parent;
+  }
+  let base = cur;
+  if (fs.existsSync(cur)) {
+    try {
+      base = fs.realpathSync(cur);
+    } catch {
+      base = cur;
+    }
+  }
+  const joined = path.resolve(segments.length > 0 ? path.join(base, ...segments) : base);
+  if (process.platform === 'win32' && !preserveCase) {
+    return joined.toLowerCase();
+  }
+  return joined;
+}
+
+export function isSubPathOrSame(parentDir, candidatePath) {
+  const normParent = resolveCanonicalPath(parentDir);
+  const normCand = resolveCanonicalPath(candidatePath);
+  const rel = path.relative(normParent, normCand);
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+export function isSameCanonicalPath(pathA, pathB) {
+  return resolveCanonicalPath(pathA) === resolveCanonicalPath(pathB);
+}
+
 export function getDefaultVaultPath(homeDir = os.homedir()) {
   return path.join(homeDir, 'Documents', 'Obsidian', 'MindLoom');
 }

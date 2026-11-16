@@ -562,3 +562,72 @@ export function normalizeAntigravityEvent(parsedEvent, provenance) {
     provenance
   };
 }
+
+function extractStringsFromJsonValue(val, out = []) {
+  if (typeof val === 'string') {
+    out.push(val);
+  } else if (Array.isArray(val)) {
+    for (const item of val) extractStringsFromJsonValue(item, out);
+  } else if (val && typeof val === 'object') {
+    for (const v of Object.values(val)) extractStringsFromJsonValue(v, out);
+  }
+  return out;
+}
+
+function matchWorkingDirectoryHint(text) {
+  const m = String(text || '').match(
+    /Command Working Directory:\s*([A-Za-z]:[\\/][^\r\n<>"|*?\x00]{1,220}|\/[^\r\n<>"|*?\x00]{1,220})/i
+  );
+  return m && m[1] ? m[1].trim() : null;
+}
+
+/**
+ * 从 Antigravity transcript.jsonl 头部可靠提取工作目录线索 (Setup 与 auto-sync 共享单一真源)
+ * 若无法可靠提取则返回 null，绝不猜测项目归属
+ * @param {string} filePath
+ * @returns {string | null}
+ */
+export function extractAntigravityCwdHint(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) return null;
+  try {
+    const fd = fs.openSync(filePath, 'r');
+    try {
+      const buf = Buffer.allocUnsafe(262144);
+      const n = fs.readSync(fd, buf, 0, buf.length, 0);
+      if (n <= 0) return null;
+      const head = buf.subarray(0, n).toString('utf8');
+
+      // 1. Prefer proper JSON line parsing so escaped \\ and \n are decoded cleanly
+      for (const line of head.split(/\r?\n/)) {
+        const trimmed = line.replace(/^\uFEFF/, '').trim();
+        if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) continue;
+        try {
+          const parsed = JSON.parse(trimmed);
+          if (parsed && typeof parsed.cwd === 'string' && parsed.cwd.trim()) {
+            return parsed.cwd.trim();
+          }
+          const strings = extractStringsFromJsonValue(parsed);
+          for (const s of strings) {
+            const hit = matchWorkingDirectoryHint(s);
+            if (hit) return hit;
+          }
+        } catch {
+          // ignore partial/malformed JSON line
+        }
+      }
+
+      // 2. Fallback for truncated/raw text: stop before unescaped JSON \n, \r, \t, \"
+      const rawMatch = head.match(
+        /Command Working Directory:\s*([A-Za-z]:(?:\\\\|[\\/])(?:(?!(?<!\\)\\[nrt"]).){1,220}|\/(?:(?!(?<!\\)\\[nrt"]).){1,220})/i
+      );
+      if (rawMatch && rawMatch[1]) {
+        return rawMatch[1].replace(/\\\\/g, '\\').trim();
+      }
+      return matchWorkingDirectoryHint(head);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+}

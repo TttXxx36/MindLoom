@@ -1,6 +1,6 @@
 {
   "name": "mindloom",
-  "version": "1.0.0",
+  "version": "1.0.1-beta.1",
   "description": "MindLoom — Local-first Agent × Obsidian memory vault CLI, cross-platform setup wizard, and companion console plugin.",
   "type": "module",
   "license": "MIT",
@@ -55,6 +55,6 @@
     "deploy": "node cli/deploy.mjs --apply"
   },
   "engines": {
-    "node": ">=22.0.0"
+    "node": "^22.15.0 || ^23.8.0 || >=24.0.0"
   }
 }

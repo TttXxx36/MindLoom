@@ -83,8 +83,20 @@ export default class MindLoomPlugin extends Plugin {
   }
 
   async loadSettings(): Promise<void> {
-    const loaded = (await this.loadData()) as Partial<MindLoomSettings> | null;
-    this.settings = { ...DEFAULT_SETTINGS, ...(loaded || {}) };
+    try {
+      const loaded = (await this.loadData()) as Partial<MindLoomSettings> | null;
+      if (loaded && typeof loaded === 'object' && !Array.isArray(loaded)) {
+        this.settings = { ...DEFAULT_SETTINGS, ...loaded };
+      } else {
+        this.settings = { ...DEFAULT_SETTINGS };
+      }
+    } catch (err) {
+      this.settings = { ...DEFAULT_SETTINGS };
+      new Notice(
+        `MindLoom: failed to parse plugin data.json (${err instanceof Error ? err.message : String(err)}); using defaults without overwriting file.`,
+        8000
+      );
+    }
   }
 
   async saveSettings(): Promise<void> {
@@ -147,21 +159,49 @@ export default class MindLoomPlugin extends Plugin {
 
   async runSyncAndRebuildMoc(): Promise<void> {
     new Notice('MindLoom: syncing whitelisted sessions & rebuilding 00_MOC...');
-    const syncRes = await this.bridge.runJson<{ syncedCount?: number; skippedUnapprovedCount?: number }>([
-      'auto-sync'
-    ]);
-    const mocRes = await this.bridge.runJson<{ projectsCount?: number; sanitizedNotesCount?: number }>([
-      'render-moc',
-      '--update-digests'
-    ]);
-    if (mocRes.ok && mocRes.data) {
-      const syncMsg = syncRes.ok && syncRes.data ? `synced=${syncRes.data.syncedCount ?? 0}, ` : '';
-      new Notice(
-        `MindLoom: ${syncMsg}MOC rebuilt (${mocRes.data.projectsCount ?? 0} projects, ${mocRes.data.sanitizedNotesCount ?? 0} notes).`
-      );
+    const syncRes = await this.bridge.runJson<{
+      syncedCount?: number;
+      alreadySyncedCount?: number;
+      skippedUnmappedCount?: number;
+      skippedUnapprovedCount?: number;
+      errorsCount?: number;
+      mocUpdated?: boolean;
+    }>(['auto-sync', '--no-moc']);
+
+    if (!syncRes.ok || !syncRes.data) {
+      new Notice(`MindLoom Sync failed: ${syncRes.error || 'unknown error'}`, 8000);
     } else {
-      new Notice(`MindLoom sync/MOC failed: ${mocRes.error || syncRes.error || 'unknown error'}`);
+      const d = syncRes.data;
+      const synced = d.syncedCount ?? 0;
+      const errCount = d.errorsCount ?? 0;
+      const unapproved = d.skippedUnapprovedCount ?? 0;
+      const unmapped = d.skippedUnmappedCount ?? 0;
+      if (errCount > 0 || unapproved > 0) {
+        new Notice(
+          `MindLoom Sync completed with warnings: synced=${synced}, errors=${errCount}, unapproved=${unapproved}, unmapped=${unmapped}.`,
+          8000
+        );
+      } else {
+        new Notice(`MindLoom Sync: synced=${synced}, unmapped=${unmapped}.`);
+      }
     }
+
+    if (!syncRes.ok || !syncRes.data?.mocUpdated) {
+      const mocRes = await this.bridge.runJson<{ projectsCount?: number; sanitizedNotesCount?: number }>([
+        'render-moc',
+        '--update-digests'
+      ]);
+      if (mocRes.ok && mocRes.data) {
+        new Notice(
+          `MindLoom MOC rebuilt: ${mocRes.data.projectsCount ?? 0} projects, ${mocRes.data.sanitizedNotesCount ?? 0} notes.`
+        );
+      } else {
+        new Notice(`MindLoom MOC rebuild failed: ${mocRes.error || 'unknown error'}`, 8000);
+      }
+    } else {
+      new Notice('MindLoom MOC already updated by auto-sync.');
+    }
+
     await this.refreshStatusBar();
     for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_MINDLOOM_CONSOLE)) {
       if (leaf.view instanceof MindLoomConsoleView) {

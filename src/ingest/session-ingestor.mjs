@@ -57,7 +57,7 @@ const KNOWN_EVENT_TYPES = new Set([
  * }} params
  * @returns {string}
  */
-export function resolveProjectFromMap({
+export function resolveProjectMatchFromMap({
   dataDir = null,
   explicitProject = null,
   sessionHints = {}
@@ -79,19 +79,19 @@ export function resolveProjectFromMap({
       for (const item of rawMap.projects) {
         if (!item || !item.project) continue;
         if (String(item.project).toLowerCase() === lowerExplicit) {
-          return item.project;
+          return { project: item.project, matched: true, reason: 'explicit' };
         }
         const aliases = Array.isArray(item.aliases) ? item.aliases : [];
         if (aliases.some(a => String(a || '').trim().toLowerCase() === lowerExplicit)) {
-          return item.project;
+          return { project: item.project, matched: true, reason: 'explicit' };
         }
       }
     }
-    return trimmed;
+    return { project: trimmed, matched: true, reason: 'explicit' };
   }
 
   if (!rawMap) {
-    return 'unmapped';
+    return { project: 'unmapped', matched: false, reason: 'unmapped' };
   }
 
   try {
@@ -133,12 +133,20 @@ export function resolveProjectFromMap({
     }
 
     if (matchedProjects.size === 1) {
-      return [...matchedProjects][0];
+      return { project: [...matchedProjects][0], matched: true, reason: 'rule_matched' };
     }
-    return fallbackUnmapped;
+    return {
+      project: fallbackUnmapped,
+      matched: false,
+      reason: matchedProjects.size > 1 ? 'ambiguous' : 'unmapped'
+    };
   } catch {
-    return 'unmapped';
+    return { project: 'unmapped', matched: false, reason: 'unmapped' };
   }
+}
+
+export function resolveProjectFromMap(params = {}) {
+  return resolveProjectMatchFromMap(params).project;
 }
 
 import { getConfiguredSourceRoots } from '../config/paths.mjs';

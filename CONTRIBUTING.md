@@ -4,7 +4,7 @@ Thank you for contributing to **MindLoom**!
 
 ## Development Requirements
 
-- **Node.js >= 22** (required for built-in `node:sqlite` and `node:zlib` Zstd support)
+- **Node.js 22 LTS (`>= 22.15.0`) or Node.js 24+ LTS** (required for built-in `node:sqlite` and `node:zlib` Zstd support; 23.x requires `>= 23.8.0`)
 - **Git**
 - **Obsidian Desktop** (optional, for testing the companion plugin UI)
 

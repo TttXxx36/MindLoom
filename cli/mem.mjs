@@ -12,7 +12,8 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { initRepository, DEFAULT_VAULT_PATH, DEFAULT_DATA_PATH } from '../src/init.mjs';
 const DEFAULT_REPO_ROOT_HINT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-import { resolveConfiguredPaths, readInstallConfig } from '../src/config/paths.mjs';
+import { resolveConfiguredPaths, readInstallConfig, isSubPathOrSame, isNodeVersionSupported } from '../src/config/paths.mjs';
+import { validateVaultDataPairing } from '../src/storage/instance-identity.mjs';
 import { runSetupWizard } from '../src/setup/wizard.mjs';
 import { DEFAULT_PRICING_CATALOG } from '../src/security/cloud-approvals.mjs';
 import { DEFAULT_OPERATOR_ROOT, buildOperatorIsolationTargets } from '../src/security/isolation-sentinel.mjs';
@@ -369,72 +370,6 @@ function isVaultNoteSanitizedForExitB(db, filePath, noteId) {
   return true;
 }
 
-function isSubPathOrSame(parentDir, candidatePath) {
-  const normParent = process.platform === 'win32' ? path.resolve(parentDir).toLowerCase() : path.resolve(parentDir);
-  const normCand = process.platform === 'win32' ? path.resolve(candidatePath).toLowerCase() : path.resolve(candidatePath);
-  const rel = path.relative(normParent, normCand);
-  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
-}
-
-function validateVaultDataPairing({ db, vaultPath, dataPath }) {
-  const resolvedVault = path.resolve(vaultPath);
-  const resolvedData = path.resolve(dataPath);
-  if (!fs.existsSync(resolvedVault) || !fs.statSync(resolvedVault).isDirectory()) {
-    return { ok: false, code: 'ERR_VAULT_NOT_FOUND', message: `Vault 目录不存在: ${resolvedVault}` };
-  }
-  if (fs.existsSync(path.join(resolvedVault, 'runtime', 'state.sqlite'))) {
-    return { ok: false, code: 'ERR_VAULT_IS_DATA_DIR', message: `目标 Vault (${resolvedVault}) 实为 Data 运行目录` };
-  }
-  if (isSubPathOrSame(resolvedVault, resolvedData) || isSubPathOrSame(resolvedData, resolvedVault)) {
-    return { ok: false, code: 'ERR_VAULT_DATA_NESTED', message: `Vault (${resolvedVault}) 与 Data (${resolvedData}) 不得重叠或嵌套` };
-  }
-  const noteRows = db.prepare('SELECT id, path FROM notes').all();
-  const absRows = noteRows.filter(r => r.path && path.isAbsolute(r.path));
-  let matchedNotesInVault = 0;
-  for (const row of absRows) {
-    if (isSubPathOrSame(resolvedVault, row.path)) {
-      matchedNotesInVault++;
-    }
-  }
-  if (absRows.length > 0 && matchedNotesInVault === 0) {
-    return {
-      ok: false,
-      code: 'ERR_VAULT_DATA_MISMATCH',
-      message: `Vault 与 Data 不配对：Data 台账 (${resolvedData}) 中 ${absRows.length} 篇笔记均不在 Vault (${resolvedVault}) 内`
-    };
-  }
-  if (absRows.length === 0) {
-    const intentRows = db.prepare('SELECT target_path, staging_path FROM publish_intents').all();
-    const snapRows = db.prepare('SELECT readable_session_path, raw_path FROM session_snapshots').all();
-    const absVaultRefs = [
-      ...intentRows.map(r => r.target_path),
-      ...snapRows.map(r => r.readable_session_path)
-    ].filter(p => p && path.isAbsolute(p));
-    const absDataRefs = [
-      ...intentRows.map(r => r.staging_path),
-      ...snapRows.map(r => r.raw_path)
-    ].filter(p => p && path.isAbsolute(p));
-    if (
-      (absVaultRefs.length > 0 && absVaultRefs.every(p => !isSubPathOrSame(resolvedVault, p))) ||
-      (absDataRefs.length > 0 && absDataRefs.every(p => !isSubPathOrSame(resolvedData, p)))
-    ) {
-      return {
-        ok: false,
-        code: 'ERR_VAULT_DATA_MISMATCH',
-        message: `Vault (${resolvedVault}) 与 Data (${resolvedData}) 不配对：意图/快照台账记录指向其他目录`
-      };
-    }
-  }
-  return {
-    ok: true,
-    vaultPath: resolvedVault,
-    dataPath: resolvedData,
-    matchedNotesInVault,
-    totalDbNotes: noteRows.length,
-    unmatchedNotesCount: Math.max(0, absRows.length - matchedNotesInVault)
-  };
-}
-
 const command = process.argv[2];
 
 function printUsage() {
@@ -617,8 +552,7 @@ try {
     const effDbPath = path.join(effDataPath, 'runtime', 'state.sqlite');
 
     let hasCriticalFailure = false;
-    const nodeMajor = Number(process.versions.node.split('.')[0]);
-    const nodeOk = nodeMajor >= 22;
+    const nodeOk = isNodeVersionSupported(process.versions.node);
     if (!nodeOk) hasCriticalFailure = true;
 
     let sqliteOk = false;
@@ -773,7 +707,7 @@ try {
       safeLog(JSON.stringify(jsonReport, null, 2));
     } else {
       safeLog(`[mem doctor] 运行环境诊断:`);
-      safeLog(`  - Node.js 版本: ${process.version} (需要 >= 22.0.0, 状态: ${nodeOk ? '正常' : '版本过低'})`);
+      safeLog(`  - Node.js 版本: ${process.version} (需要 Node 22 LTS >= 22.15.0 / 24+ LTS, 状态: ${nodeOk ? '正常' : '版本过低'})`);
       safeLog(`  - 平台架构:     ${process.platform} (${process.arch})`);
       safeLog(`  - node:sqlite 内置支持: ${sqliteOk ? '正常' : '不可用'}`);
       safeLog(`  - node:zlib Zstd 支持:  ${zstdOk ? '正常' : '不可用'}`);

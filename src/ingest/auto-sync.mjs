@@ -8,9 +8,10 @@ import { recordOperationSettlement } from '../storage/write-lock.mjs';
 import {
   PARSER_VERSION,
   listDiscoverableSessions,
-  resolveProjectFromMap,
+  resolveProjectMatchFromMap,
   ingestSession
 } from './session-ingestor.mjs';
+import { extractAntigravityCwdHint } from './adapters/antigravity-adapter.mjs';
 import { rebuildVaultMocAndHome } from './human-digest.mjs';
 
 function computeFileSha256(filePath) {
@@ -30,24 +31,8 @@ function readQuickWorkspaceHints(sessionItem) {
     return hints;
   }
 
-  // 读取 Antigravity/Codex 前 24KB 头块，识别内嵌的 Command Working Directory / Active Workspaces
-  try {
-    const fd = fs.openSync(sessionItem._internal_source_path, 'r');
-    try {
-      const buf = Buffer.allocUnsafe(24576);
-      const n = fs.readSync(fd, buf, 0, buf.length, 0);
-      if (n > 0) {
-        const head = buf.subarray(0, n).toString('utf8');
-        const cwdMatch = head.match(/Command Working Directory:\s*([^\r\n\\"]+(?:[\\/][^\r\n\\"]+)*)/i);
-        if (cwdMatch && cwdMatch[1]) {
-          hints.cwd = cwdMatch[1].trim();
-        }
-      }
-    } finally {
-      fs.closeSync(fd);
-    }
-  } catch {
-    // ignore read error; keep discovered hints
+  if (sessionItem.source_tool === 'antigravity') {
+    hints.cwd = extractAntigravityCwdHint(sessionItem._internal_source_path);
   }
   return hints;
 }
@@ -147,20 +132,22 @@ export function runWhitelistAutoSync({
     }
 
     const hints = readQuickWorkspaceHints(item);
-    const resolvedProject = resolveProjectFromMap({
+    const projectMatch = resolveProjectMatchFromMap({
       dataDir,
       explicitProject: 'auto',
       sessionHints: hints
     });
 
-    if (resolvedProject === 'unmapped') {
+    if (!projectMatch.matched || projectMatch.reason !== 'rule_matched') {
       skippedUnmapped.push({
         sourceTool: item.source_tool,
         sessionId: item.session_id,
+        reason: projectMatch.reason,
         cwdHint: hints.cwd || null
       });
       continue;
     }
+    const resolvedProject = projectMatch.project;
 
     const expectedSnapshotId = computeCandidateSnapshotId(item);
     const existingSnap = db

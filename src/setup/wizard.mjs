@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -9,15 +10,25 @@ import { initRepository, ensureMissingTemplates } from '../init.mjs';
 import { openExistingDatabase } from '../db/sqlite.mjs';
 import { initGitRepo } from '../git/repo-manager.mjs';
 import { listDiscoverableSessions } from '../ingest/session-ingestor.mjs';
+import { extractAntigravityCwdHint } from '../ingest/adapters/antigravity-adapter.mjs';
 import { issueTrustedLowSensitivityApproval } from '../security/trusted-approvals.mjs';
 import { withWriteLock } from '../storage/write-lock.mjs';
 import {
+  assertVaultDataIsolation,
+  ensureInstanceIdentity,
+  readInstanceIdentity,
+  validateVaultDataPairing
+} from '../storage/instance-identity.mjs';
+import {
   getConfiguredSourceRoots,
+  isNodeVersionSupported,
   resolveConfiguredPaths,
   writeInstallConfig
 } from '../config/paths.mjs';
 import { generateSchedulePlan, applySchedulePlan } from '../schedule/scheduler.mjs';
 import { runDeploy } from '../../cli/deploy.mjs';
+
+export { extractAntigravityCwdHint };
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -55,8 +66,7 @@ export function checkTrustedHumanTerminal({ env = process.env, isTty = Boolean(p
 }
 
 export async function runPreflightChecks({ vaultPath, dataPath }) {
-  const nodeMajor = Number(process.versions.node.split('.')[0]);
-  const nodeOk = nodeMajor >= 22;
+  const nodeOk = isNodeVersionSupported(process.versions.node);
 
   let sqliteOk = false;
   try {
@@ -180,66 +190,6 @@ function sanitizeProjectName(rawName) {
     .join('');
 }
 
-function extractStringsFromJsonValue(val, out = []) {
-  if (typeof val === 'string') {
-    out.push(val);
-  } else if (Array.isArray(val)) {
-    for (const item of val) extractStringsFromJsonValue(item, out);
-  } else if (val && typeof val === 'object') {
-    for (const v of Object.values(val)) extractStringsFromJsonValue(v, out);
-  }
-  return out;
-}
-
-function matchWorkingDirectoryHint(text) {
-  const m = String(text || '').match(
-    /Command Working Directory:\s*([A-Za-z]:[\\/][^\r\n<>"|*?\x00]{1,220}|\/[^\r\n<>"|*?\x00]{1,220})/i
-  );
-  return m && m[1] ? m[1].trim() : null;
-}
-
-export function extractAntigravityCwdHint(filePath) {
-  if (!filePath || !fs.existsSync(filePath)) return null;
-  try {
-    const fd = fs.openSync(filePath, 'r');
-    try {
-      const buf = Buffer.allocUnsafe(65536);
-      const n = fs.readSync(fd, buf, 0, buf.length, 0);
-      if (n <= 0) return null;
-      const head = buf.subarray(0, n).toString('utf8');
-
-      // 1. Prefer proper JSON line parsing so escaped \\ and \n are decoded cleanly
-      for (const line of head.split(/\r?\n/)) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) continue;
-        try {
-          const parsed = JSON.parse(trimmed);
-          const strings = extractStringsFromJsonValue(parsed);
-          for (const s of strings) {
-            const hit = matchWorkingDirectoryHint(s);
-            if (hit) return hit;
-          }
-        } catch {
-          // ignore partial/malformed JSON line
-        }
-      }
-
-      // 2. Fallback for truncated/raw text: stop before unescaped JSON \n, \r, \t, \"
-      const rawMatch = head.match(
-        /Command Working Directory:\s*([A-Za-z]:(?:\\\\|[\\/])(?:(?!(?<!\\)\\[nrt"]).){1,220}|\/(?:(?!(?<!\\)\\[nrt"]).){1,220})/i
-      );
-      if (rawMatch && rawMatch[1]) {
-        return rawMatch[1].replace(/\\\\/g, '\\').trim();
-      }
-      return matchWorkingDirectoryHint(head);
-    } finally {
-      fs.closeSync(fd);
-    }
-  } catch {
-    return null;
-  }
-}
-
 export function discoverCandidateWorkspaces({
   sourceRoots = {},
   homeDir = os.homedir(),
@@ -317,13 +267,85 @@ export function discoverCandidateWorkspaces({
   return candidates;
 }
 
+export function validateProjectMapObject(parsedMap, mapPath = 'project-map.json') {
+  if (!parsedMap || typeof parsedMap !== 'object' || Array.isArray(parsedMap)) {
+    const err = new Error(`project-map.json 根对象必须是 JSON object (${mapPath})`);
+    err.code = 'INVALID_PROJECT_MAP_SCHEMA';
+    throw err;
+  }
+
+  if (
+    parsedMap.schema_version !== undefined &&
+    (typeof parsedMap.schema_version !== 'number' || !Number.isInteger(parsedMap.schema_version))
+  ) {
+    const err = new Error(`INVALID_PROJECT_MAP_SCHEMA: 字段 schema_version 必须是整数 (${mapPath})`);
+    err.code = 'INVALID_PROJECT_MAP_SCHEMA';
+    throw err;
+  }
+
+  if (parsedMap.default_unmapped_project !== undefined && typeof parsedMap.default_unmapped_project !== 'string') {
+    const err = new Error(`INVALID_PROJECT_MAP_SCHEMA: 字段 default_unmapped_project 必须是字符串 (${mapPath})`);
+    err.code = 'INVALID_PROJECT_MAP_SCHEMA';
+    throw err;
+  }
+
+  if (parsedMap.projects !== undefined) {
+    if (!Array.isArray(parsedMap.projects)) {
+      const err = new Error(`INVALID_PROJECT_MAP_SCHEMA: 字段 projects 必须是数组 (${mapPath})`);
+      err.code = 'INVALID_PROJECT_MAP_SCHEMA';
+      throw err;
+    }
+
+    const stringArrayFields = ['paths', 'git_roots', 'workspace_slugs', 'aliases'];
+    for (let idx = 0; idx < parsedMap.projects.length; idx++) {
+      const entry = parsedMap.projects[idx];
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        const err = new Error(`INVALID_PROJECT_MAP_SCHEMA: 字段 projects[${idx}] 必须是对象 (${mapPath})`);
+        err.code = 'INVALID_PROJECT_MAP_SCHEMA';
+        throw err;
+      }
+      if (typeof entry.project !== 'string' || !entry.project.trim()) {
+        const err = new Error(`INVALID_PROJECT_MAP_SCHEMA: 字段 projects[${idx}].project 必须是非空字符串 (${mapPath})`);
+        err.code = 'INVALID_PROJECT_MAP_SCHEMA';
+        throw err;
+      }
+      for (const field of stringArrayFields) {
+        if (entry[field] === undefined) continue;
+        if (!Array.isArray(entry[field])) {
+          const err = new Error(`INVALID_PROJECT_MAP_SCHEMA: 字段 projects[${idx}].${field} 必须是字符串数组 (${mapPath})`);
+          err.code = 'INVALID_PROJECT_MAP_SCHEMA';
+          throw err;
+        }
+        for (let j = 0; j < entry[field].length; j++) {
+          if (typeof entry[field][j] !== 'string') {
+            const err = new Error(
+              `INVALID_PROJECT_MAP_SCHEMA: 字段 projects[${idx}].${field}[${j}] 必须是字符串 (${mapPath})`
+            );
+            err.code = 'INVALID_PROJECT_MAP_SCHEMA';
+            throw err;
+          }
+        }
+      }
+    }
+  }
+
+  return parsedMap;
+}
+
 export function mergeProjectMapEntries(existingMap, newEntries) {
   const base =
     existingMap && typeof existingMap === 'object'
       ? {
           schema_version: existingMap.schema_version || 1,
           default_unmapped_project: existingMap.default_unmapped_project || 'unmapped',
-          projects: Array.isArray(existingMap.projects) ? existingMap.projects.map((p) => ({ ...p })) : []
+          projects: Array.isArray(existingMap.projects)
+            ? existingMap.projects.map((p) => ({
+                ...p,
+                paths: Array.isArray(p.paths) ? [...p.paths] : [],
+                git_roots: Array.isArray(p.git_roots) ? [...p.git_roots] : [],
+                workspace_slugs: Array.isArray(p.workspace_slugs) ? [...p.workspace_slugs] : []
+              }))
+            : []
         }
       : {
           schema_version: 1,
@@ -366,7 +388,29 @@ export function mergeProjectMapEntries(existingMap, newEntries) {
   return { projectMap: base, addedProjects };
 }
 
-export function deployCompanionPlugin({
+function stripUtf8Bom(text) {
+  return String(text || '').replace(/^\uFEFF/, '');
+}
+
+function writeFileAtomicSameDir(targetPath, content) {
+  const dir = path.dirname(targetPath);
+  fs.mkdirSync(dir, { recursive: true });
+  const tmpPath = path.join(dir, `.${path.basename(targetPath)}.tmp-${process.pid}-${crypto.randomUUID()}`);
+  try {
+    fs.writeFileSync(tmpPath, content, 'utf8');
+    fs.renameSync(tmpPath, targetPath);
+  } finally {
+    try {
+      if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+    } catch {
+      // ignore cleanup error
+    }
+  }
+}
+
+const REQUIRED_PLUGIN_ASSETS = Object.freeze(['manifest.json', 'main.js', 'styles.css']);
+
+export function prepareCompanionPluginPlan({
   vaultPath,
   dataPath,
   pluginDistDir = path.join(DEFAULT_REPO_ROOT, 'plugin', 'dist'),
@@ -379,71 +423,141 @@ export function deployCompanionPlugin({
   const pluginsDir = path.join(obsidianDir, 'plugins');
   const targetPluginDir = path.join(pluginsDir, pluginId);
   const communityPluginsPath = path.join(obsidianDir, 'community-plugins.json');
-
-  if (!fs.existsSync(pluginDistDir) || !fs.existsSync(path.join(pluginDistDir, 'main.js'))) {
-    return {
-      deployed: false,
-      status: 'plugin_dist_missing',
-      pluginDistDir,
-      targetPluginDir
-    };
-  }
-
-  fs.mkdirSync(targetPluginDir, { recursive: true });
-  const copiedFiles = [];
-  for (const fileName of ['manifest.json', 'main.js', 'styles.css']) {
-    const src = path.join(pluginDistDir, fileName);
-    if (fs.existsSync(src)) {
-      fs.copyFileSync(src, path.join(targetPluginDir, fileName));
-      copiedFiles.push(fileName);
-    }
-  }
-
-  // Write non-secret plugin data.json defaults if missing, or refresh detected paths cleanly
   const pluginDataPath = path.join(targetPluginDir, 'data.json');
-  let existingData = {};
-  if (fs.existsSync(pluginDataPath)) {
-    try {
-      existingData = JSON.parse(fs.readFileSync(pluginDataPath, 'utf8')) || {};
-    } catch {
-      existingData = {};
+
+  if (!fs.existsSync(pluginDistDir)) {
+    const err = new Error(`PLUGIN_DIST_INCOMPLETE: 插件构建目录不存在 (${pluginDistDir})，请先构建插件或传入 --skip-plugin`);
+    err.code = 'PLUGIN_DIST_INCOMPLETE';
+    throw err;
+  }
+
+  const missingAssets = [];
+  for (const fileName of REQUIRED_PLUGIN_ASSETS) {
+    const src = path.join(pluginDistDir, fileName);
+    if (!fs.existsSync(src) || !fs.statSync(src).isFile() || fs.statSync(src).size === 0) {
+      missingAssets.push(fileName);
     }
   }
-  const mergedData = {
-    ...existingData,
-    vaultPath: resolvedVault,
-    dataPath: resolvedData,
-    cliPath: path.join(resolvedData, 'cli', 'mem.mjs'),
-    nodePath: nodePath || existingData.nodePath || process.execPath
-  };
-  fs.writeFileSync(pluginDataPath, JSON.stringify(mergedData, null, 2) + '\n', 'utf8');
+  if (missingAssets.length > 0) {
+    const err = new Error(
+      `PLUGIN_DIST_INCOMPLETE: 缺少必需插件构建产物 (${missingAssets.join(', ')}) in ${pluginDistDir}，请先构建插件或传入 --skip-plugin`
+    );
+    err.code = 'PLUGIN_DIST_INCOMPLETE';
+    throw err;
+  }
 
-  // Safely merge .obsidian/community-plugins.json (preserve all user plugins!)
+  try {
+    const manifestObj = JSON.parse(stripUtf8Bom(fs.readFileSync(path.join(pluginDistDir, 'manifest.json'), 'utf8')));
+    if (!manifestObj || typeof manifestObj !== 'object' || typeof manifestObj.id !== 'string' || !manifestObj.id.trim() || typeof manifestObj.version !== 'string' || !manifestObj.version.trim()) {
+      throw new Error('manifest.json missing id or version');
+    }
+  } catch (err) {
+    const manifestErr = new Error(
+      `INVALID_PLUGIN_MANIFEST: 无法解析插件 manifest.json (${err.message})，已中止安装`
+    );
+    manifestErr.code = 'INVALID_PLUGIN_MANIFEST';
+    throw manifestErr;
+  }
+
+  // Validate existing community-plugins.json & plugin data.json BEFORE copying or modifying any files
   let existingPlugins = [];
   if (fs.existsSync(communityPluginsPath)) {
+    const rawPlugins = stripUtf8Bom(fs.readFileSync(communityPluginsPath, 'utf8'));
+    let parsedPlugins;
     try {
-      const parsed = JSON.parse(fs.readFileSync(communityPluginsPath, 'utf8'));
-      if (Array.isArray(parsed)) {
-        existingPlugins = parsed.filter((x) => typeof x === 'string' && x.trim().length > 0);
-      }
-    } catch {
-      existingPlugins = [];
+      parsedPlugins = JSON.parse(rawPlugins);
+    } catch (err) {
+      const parseErr = new Error(
+        `INVALID_COMMUNITY_PLUGINS_JSON: 无法解析 ${communityPluginsPath} (${err.message})，已保留原文件未作修改`
+      );
+      parseErr.code = 'INVALID_COMMUNITY_PLUGINS_JSON';
+      throw parseErr;
     }
+    if (!Array.isArray(parsedPlugins) || parsedPlugins.some((x) => typeof x !== 'string' || x.trim().length === 0)) {
+      const fmtErr = new Error(
+        `INVALID_COMMUNITY_PLUGINS_FORMAT: ${communityPluginsPath} 必须为非空字符串数组，已保留原文件未作修改`
+      );
+      fmtErr.code = 'INVALID_COMMUNITY_PLUGINS_FORMAT';
+      throw fmtErr;
+    }
+    existingPlugins = [...parsedPlugins];
   }
-  if (!existingPlugins.includes(pluginId)) {
-    existingPlugins.push(pluginId);
+
+  let existingData = {};
+  if (fs.existsSync(pluginDataPath)) {
+    const rawData = stripUtf8Bom(fs.readFileSync(pluginDataPath, 'utf8'));
+    let parsedData;
+    try {
+      parsedData = JSON.parse(rawData);
+    } catch (err) {
+      const parseErr = new Error(
+        `INVALID_PLUGIN_DATA_JSON: 无法解析 ${pluginDataPath} (${err.message})，已保留原文件未作修改`
+      );
+      parseErr.code = 'INVALID_PLUGIN_DATA_JSON';
+      throw parseErr;
+    }
+    if (!parsedData || typeof parsedData !== 'object' || Array.isArray(parsedData)) {
+      const fmtErr = new Error(
+        `INVALID_PLUGIN_DATA_FORMAT: ${pluginDataPath} 必须为 JSON 对象，已保留原文件未作修改`
+      );
+      fmtErr.code = 'INVALID_PLUGIN_DATA_FORMAT';
+      throw fmtErr;
+    }
+    existingData = parsedData;
   }
-  fs.writeFileSync(communityPluginsPath, JSON.stringify(existingPlugins, null, 2) + '\n', 'utf8');
+
+  return {
+    resolvedVault,
+    resolvedData,
+    pluginDistDir,
+    pluginId,
+    targetPluginDir,
+    communityPluginsPath,
+    pluginDataPath,
+    existingPlugins,
+    existingData,
+    nodePath
+  };
+}
+
+export function applyCompanionPluginPlan(plan) {
+  fs.mkdirSync(plan.targetPluginDir, { recursive: true });
+  const copiedFiles = [];
+  for (const fileName of REQUIRED_PLUGIN_ASSETS) {
+    const src = path.join(plan.pluginDistDir, fileName);
+    fs.copyFileSync(src, path.join(plan.targetPluginDir, fileName));
+    copiedFiles.push(fileName);
+  }
+
+  const mergedData = {
+    ...plan.existingData,
+    vaultPath: plan.resolvedVault,
+    dataPath: plan.resolvedData,
+    cliPath: path.join(plan.resolvedData, 'cli', 'mem.mjs'),
+    nodePath: plan.nodePath || plan.existingData.nodePath || process.execPath
+  };
+  writeFileAtomicSameDir(plan.pluginDataPath, JSON.stringify(mergedData, null, 2) + '\n');
+
+  const enabledPlugins = [...plan.existingPlugins];
+  if (!enabledPlugins.includes(plan.pluginId)) {
+    enabledPlugins.push(plan.pluginId);
+  }
+  writeFileAtomicSameDir(plan.communityPluginsPath, JSON.stringify(enabledPlugins, null, 2) + '\n');
 
   return {
     deployed: true,
     status: 'deployed',
-    pluginId,
-    targetPluginDir,
+    pluginId: plan.pluginId,
+    targetPluginDir: plan.targetPluginDir,
     copiedFiles,
-    communityPluginsPath,
-    enabledPlugins: existingPlugins
+    communityPluginsPath: plan.communityPluginsPath,
+    enabledPlugins
   };
+}
+
+export function deployCompanionPlugin(options = {}) {
+  const plan = prepareCompanionPluginPlan(options);
+  return applyCompanionPluginPlan(plan);
 }
 
 export async function runSetupWizard(options = {}) {
@@ -495,7 +609,7 @@ export async function runSetupWizard(options = {}) {
     dataPath = ans ? path.resolve(ans) : path.resolve(defaultData);
   }
 
-  // 1. Preflight checks
+  // 1. Preflight, isolation/pairing, plugin dist/config validation & prompts (ZERO filesystem writes before all pass)
   const preflight = await runPreflightChecks({ vaultPath, dataPath });
   if (!preflight.ok) {
     throw new Error(
@@ -503,25 +617,50 @@ export async function runSetupWizard(options = {}) {
     );
   }
 
-  // 2. Initialize or verify dual directories
+  assertVaultDataIsolation({ vaultPath, dataPath });
+
   const dbPath = path.join(dataPath, 'runtime', 'state.sqlite');
   let initStatus = 'already_initialized';
-  if (!fs.existsSync(dbPath)) {
-    initRepository({ vaultPath, dataPath });
-    initStatus = 'initialized';
-  } else {
-    ensureMissingTemplates({ vaultPath });
+  let needsIdentityMigration = false;
+  if (fs.existsSync(dbPath)) {
+    const checkDb = openExistingDatabase(dbPath, { readOnly: true });
+    try {
+      const pairing = validateVaultDataPairing({ db: checkDb, vaultPath, dataPath });
+      if (!pairing.ok) {
+        const err = new Error(`[${pairing.code}] ${pairing.message}`);
+        err.code = pairing.code;
+        throw err;
+      }
+      needsIdentityMigration = !pairing.identityPersisted;
+    } finally {
+      checkDb.close();
+    }
   }
-  initGitRepo(vaultPath);
 
-  // Deploy CLI runtime into <DataDir>/cli/
-  const deployResult = runDeploy({
-    repoRoot,
-    targetDir: path.join(dataPath, 'cli'),
-    apply: true
-  });
+  const projectMapPath = path.join(dataPath, 'manifests', 'project-map.json');
+  let prevalidatedExistingMap = null;
+  if (fs.existsSync(projectMapPath)) {
+    try {
+      const parsedMap = JSON.parse(stripUtf8Bom(fs.readFileSync(projectMapPath, 'utf8')));
+      prevalidatedExistingMap = validateProjectMapObject(parsedMap, projectMapPath);
+    } catch (err) {
+      const errCode = err.code === 'INVALID_PROJECT_MAP_SCHEMA' ? 'INVALID_PROJECT_MAP_SCHEMA' : 'INVALID_PROJECT_MAP_JSON';
+      const mapErr = new Error(
+        `${errCode}: 无法校验 ${projectMapPath} (${err.message})，已中止安装未修改任何文件`
+      );
+      mapErr.code = errCode;
+      throw mapErr;
+    }
+  }
 
-  // 3. Discover workspaces and update project-map.json
+  const pluginPlan = options.skipPlugin
+    ? null
+    : prepareCompanionPluginPlan({
+        vaultPath,
+        dataPath,
+        pluginDistDir: options.pluginDistDir || path.join(repoRoot, 'plugin', 'dist')
+      });
+
   const discovered = discoverCandidateWorkspaces({
     sourceRoots: options.sourceRoots || {},
     homeDir: options.homeDir || os.homedir()
@@ -536,43 +675,6 @@ export async function runSetupWizard(options = {}) {
       selectedWorkspaces = [];
     }
   }
-
-  const projectMapPath = path.join(dataPath, 'manifests', 'project-map.json');
-  const { addedProjects } = withWriteLock({ dataPath, command: 'setup-project-map' }, () => {
-    let existingMap = null;
-    if (fs.existsSync(projectMapPath)) {
-      try {
-        existingMap = JSON.parse(fs.readFileSync(projectMapPath, 'utf8'));
-      } catch {
-        existingMap = null;
-      }
-    }
-    const merged = mergeProjectMapEntries(existingMap, selectedWorkspaces);
-    fs.writeFileSync(projectMapPath, JSON.stringify(merged.projectMap, null, 2) + '\n', 'utf8');
-    return merged;
-  });
-
-  // 4. Write install config (including repoRoot for copy-ready admin scripts)
-  const configWrite = writeInstallConfig({
-    vaultPath,
-    dataPath,
-    operatorRoot: resolved.operatorRoot,
-    configPath: resolved.configPath,
-    extra: { repoRoot }
-  });
-
-  // 5. Deploy companion Obsidian plugin
-  const pluginResult = options.skipPlugin
-    ? { deployed: false, status: 'skipped' }
-    : deployCompanionPlugin({
-        vaultPath,
-        dataPath,
-        pluginDistDir: options.pluginDistDir || path.join(repoRoot, 'plugin', 'dist')
-      });
-
-  // 6. Optional interactive human-only auto-sync authorization & scheduler registration
-  let authorization = { authorized: false, status: 'skipped' };
-  let scheduler = { applied: false, status: 'skipped' };
 
   if (options.authorizeAutosync) {
     let confirmed = false;
@@ -595,77 +697,149 @@ export async function runSetupWizard(options = {}) {
       err.exitCode = 43;
       throw err;
     }
+  }
 
-    const ttlHours = Number(options.ttlHours || 720);
-    const issued = withWriteLock({ dataPath, command: 'setup-authorize' }, () => {
-      const db = openExistingDatabase(dbPath);
-      try {
-        const codexAp = issueTrustedLowSensitivityApproval({
-          db,
-          sourceTool: 'codex',
-          sessionId: '*',
-          approvedBy: 'human-setup-tty',
-          ttlHours,
-          trustedHumanContext: true
-        });
-        const agyAp = issueTrustedLowSensitivityApproval({
-          db,
-          sourceTool: 'antigravity',
-          sessionId: '*',
-          approvedBy: 'human-setup-tty',
-          ttlHours,
-          trustedHumanContext: true
-        });
-        return {
-          codexApprovalId: codexAp.ingestApprovalId,
-          antigravityApprovalId: agyAp.ingestApprovalId
-        };
-      } finally {
-        db.close();
+  // Pre-compute merged project map BEFORE any filesystem writes so schema/merge errors abort cleanly.
+  mergeProjectMapEntries(prevalidatedExistingMap, selectedWorkspaces);
+
+  // 2. Mutating phases (install_config written LAST after all vault/data/plugin writes succeed)
+  const completedSteps = [];
+  let deployResult;
+  let addedProjects = [];
+  let pluginResult = { deployed: false, status: 'skipped' };
+  let configWrite;
+  let authorization = { authorized: false, status: 'skipped' };
+  let scheduler = { applied: false, status: 'skipped' };
+
+  try {
+    if (!fs.existsSync(dbPath)) {
+      initRepository({ vaultPath, dataPath });
+      initStatus = 'initialized';
+    } else {
+      if (needsIdentityMigration) {
+        ensureInstanceIdentity({ vaultPath, dataPath });
       }
+      ensureMissingTemplates({ vaultPath });
+    }
+    initGitRepo(vaultPath);
+    completedSteps.push('vault_and_data_init');
+
+    deployResult = runDeploy({
+      repoRoot,
+      targetDir: path.join(dataPath, 'cli'),
+      apply: true
     });
+    completedSteps.push('cli_deploy');
 
-    const autoSyncConfigPath = path.join(dataPath, 'manifests', 'auto-sync-config.json');
-    const autoSyncCfg = {
-      version: 1,
-      sourceTool: 'all',
-      lookbackDays: 30,
-      maxSessionsPerRun: 10,
-      codexApprovalId: issued.codexApprovalId,
-      antigravityApprovalId: issued.antigravityApprovalId,
-      dshApprovalId: null,
-      vaultDir: vaultPath,
-      dataDir: dataPath,
-      ttlHours,
-      issuedAt: new Date().toISOString(),
-      expiresAt: new Date(Date.now() + ttlHours * 3_600_000).toISOString()
-    };
-    fs.writeFileSync(autoSyncConfigPath, JSON.stringify(autoSyncCfg, null, 2) + '\n', 'utf8');
-    authorization = { authorized: true, status: 'issued', autoSyncConfigPath, ...issued };
+    ({ addedProjects } = withWriteLock({ dataPath, command: 'setup-project-map' }, () => {
+      let existingMap = null;
+      if (fs.existsSync(projectMapPath)) {
+        existingMap = validateProjectMapObject(
+          JSON.parse(stripUtf8Bom(fs.readFileSync(projectMapPath, 'utf8'))),
+          projectMapPath
+        );
+      }
+      const merged = mergeProjectMapEntries(existingMap, selectedWorkspaces);
+      writeFileAtomicSameDir(projectMapPath, JSON.stringify(merged.projectMap, null, 2) + '\n');
+      return merged;
+    }));
+    completedSteps.push('project_map');
 
-    if (!options.skipScheduler) {
-      const effPlatform = options.platform || process.platform;
-      const winRunnerCand = path.join(repoRoot, 'scripts', 'auto-sync-memory.ps1');
-      const useWinRunner =
-        effPlatform === 'win32' &&
-        fs.existsSync(winRunnerCand) &&
-        !winRunnerCand.replace(/\\/g, '/').includes('/_npx/');
-      const plan = generateSchedulePlan({
-        platform: effPlatform,
-        linuxBackend: options.linuxBackend || 'auto',
-        times: options.times || ['12:20', '21:20'],
-        memCliPath: path.join(dataPath, 'cli', 'mem.mjs'),
+    if (pluginPlan) {
+      pluginResult = applyCompanionPluginPlan(pluginPlan);
+      completedSteps.push('companion_plugin');
+    }
+
+    configWrite = writeInstallConfig({
+      vaultPath,
+      dataPath,
+      operatorRoot: resolved.operatorRoot,
+      configPath: resolved.configPath,
+      extra: { repoRoot }
+    });
+    completedSteps.push('install_config');
+
+    if (options.authorizeAutosync) {
+      const ttlHours = Number(options.ttlHours || 720);
+      const issued = withWriteLock({ dataPath, command: 'setup-authorize' }, () => {
+        const db = openExistingDatabase(dbPath);
+        try {
+          const codexAp = issueTrustedLowSensitivityApproval({
+            db,
+            sourceTool: 'codex',
+            sessionId: '*',
+            approvedBy: 'human-setup-tty',
+            ttlHours,
+            trustedHumanContext: true
+          });
+          const agyAp = issueTrustedLowSensitivityApproval({
+            db,
+            sourceTool: 'antigravity',
+            sessionId: '*',
+            approvedBy: 'human-setup-tty',
+            ttlHours,
+            trustedHumanContext: true
+          });
+          return {
+            codexApprovalId: codexAp.ingestApprovalId,
+            antigravityApprovalId: agyAp.ingestApprovalId
+          };
+        } finally {
+          db.close();
+        }
+      });
+
+      const autoSyncConfigPath = path.join(dataPath, 'manifests', 'auto-sync-config.json');
+      const autoSyncCfg = {
+        version: 1,
+        sourceTool: 'all',
+        lookbackDays: 30,
+        maxSessionsPerRun: 10,
+        codexApprovalId: issued.codexApprovalId,
+        antigravityApprovalId: issued.antigravityApprovalId,
+        dshApprovalId: null,
         vaultDir: vaultPath,
         dataDir: dataPath,
-        configPath: autoSyncConfigPath,
-        runnerScriptPath: useWinRunner ? winRunnerCand : null
-      });
-      scheduler = applySchedulePlan(plan, { dryRun: Boolean(options.dryRunScheduler) });
+        ttlHours,
+        issuedAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + ttlHours * 3_600_000).toISOString()
+      };
+      writeFileAtomicSameDir(autoSyncConfigPath, JSON.stringify(autoSyncCfg, null, 2) + '\n');
+      authorization = { authorized: true, status: 'issued', autoSyncConfigPath, ...issued };
+      completedSteps.push('auto_sync_authorization');
+
+      if (!options.skipScheduler) {
+        const effPlatform = options.platform || process.platform;
+        const winRunnerCand = path.join(repoRoot, 'scripts', 'auto-sync-memory.ps1');
+        const useWinRunner =
+          effPlatform === 'win32' &&
+          fs.existsSync(winRunnerCand) &&
+          !winRunnerCand.replace(/\\/g, '/').includes('/_npx/');
+        const plan = generateSchedulePlan({
+          platform: effPlatform,
+          linuxBackend: options.linuxBackend || 'auto',
+          times: options.times || ['12:20', '21:20'],
+          memCliPath: path.join(dataPath, 'cli', 'mem.mjs'),
+          vaultDir: vaultPath,
+          dataDir: dataPath,
+          configPath: autoSyncConfigPath,
+          runnerScriptPath: useWinRunner ? winRunnerCand : null
+        });
+        scheduler = applySchedulePlan(plan, { dryRun: Boolean(options.dryRunScheduler) });
+        completedSteps.push('scheduler');
+      }
     }
+  } catch (err) {
+    err.completedSteps = [...completedSteps];
+    if (!String(err.message || '').includes('completedSteps=')) {
+      err.message = `${err.message} [completedSteps=${completedSteps.join(',') || 'none'}]`;
+    }
+    throw err;
   }
 
   return {
     ok: true,
+    completedSteps,
     preflight,
     initStatus,
     vaultPath,

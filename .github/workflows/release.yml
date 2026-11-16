@@ -6,33 +6,67 @@ on:
       - 'v*.*.*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
+  verify-and-package:
+    name: Verify, Build & Package Release Assets
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
-      - name: Run leak scan & tests
+          node-version: '22.15.0'
+      - name: Install plugin dependencies from lockfile
+        run: npm --prefix plugin ci --no-audit --no-fund
+      - name: Build & verify Obsidian companion plugin + tag version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          npm run plugin:typecheck
+          npm run plugin:build
+          node scripts/verify-release-assets.mjs
+      - name: Run leak scan & full test suite
         run: |
           node scripts/check-leaks.mjs
           npm test
-      - name: Build Obsidian companion plugin
-        run: |
-          npm --prefix plugin install --no-audit --no-fund
-          npm run plugin:typecheck
-          npm run plugin:build
-      - name: Package BRAT-compatible plugin zip
+      - name: Package BRAT-compatible assets & plugin zip
         run: |
           mkdir -p release-assets
           cp plugin/dist/main.js plugin/dist/manifest.json plugin/dist/styles.css release-assets/
           (cd plugin/dist && zip -r ../../release-assets/mindloom-obsidian-plugin.zip main.js manifest.json styles.css)
+          for f in release-assets/main.js release-assets/manifest.json release-assets/styles.css release-assets/mindloom-obsidian-plugin.zip; do
+            test -s "$f" || (echo "Missing or empty release asset: $f" && exit 1)
+          done
+      - name: Upload verified release assets artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mindloom-release-assets
+          path: |
+            release-assets/main.js
+            release-assets/manifest.json
+            release-assets/styles.css
+            release-assets/mindloom-obsidian-plugin.zip
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: verify-and-package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: mindloom-release-assets
+          path: release-assets
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
             release-assets/main.js
             release-assets/manifest.json

@@ -37,6 +37,7 @@ export interface SearchItem {
   review_state?: string;
   sources?: string[];
   event_anchors?: string[];
+  openable_links?: string[];
   snippet?: string;
   injectionDetected?: boolean;
 }

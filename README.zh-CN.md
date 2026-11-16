@@ -40,7 +40,7 @@
 ## 1 分钟快速上手
 
 ### 环境要求
-- **Node.js >= 22**（使用内置 `node:sqlite` 与 `node:zlib` Zstd）
+- **Node.js 22 LTS（`>= 22.15.0`）或 Node.js 24+ LTS**（使用内置 `node:sqlite` 与自 22.15.0 起提供的 `node:zlib` Zstd；若使用 23.x 需 `>= 23.8.0`）
 - **Git**
 - **Obsidian 桌面端**（可选，用于浏览 Bases 视图与伴侣插件控制台）
 
@@ -69,11 +69,20 @@ node cli/mem.mjs setup --yes
   bash ./scripts/install.sh --authorize-autosync
   ```
 
-### 自定义双目录路径
+### 自定义双目录路径与隔离试用
 
 ```bash
 node cli/mem.mjs setup --vault "/path/to/MyVault" --data "/path/to/MyVault-Data" --yes
 ```
+
+> **首次安装门禁与隔离试用说明：**
+> - **首次安装仅承诺空库**：初次运行 `setup` / `init` 仅用于初始化空 Vault 与空 Data 目录；若将已存在内容的 Obsidian 库配对全新的 Data 目录，系统会按防覆盖门禁返回 `INIT_ALREADY_INITIALIZED` 拒绝写入。
+> - **试用请隔离配置与会话源**：`--vault` 和 `--data` 仅切换库目录，仍会通过 `writeInstallConfig` 更新默认用户配置（`~/.mindloom/config.json`）。若要进行沙盒试用而不影响默认配置或真实会话目录，请在当前测试进程设置 `MINDLOOM_CONFIG`（并按需指定模拟会话源 `MINDLOOM_CODEX_HOME`、`MINDLOOM_ANTIGRAVITY_BRAIN_DIR`、`MINDLOOM_DSH_HOME`）：
+>   ```powershell
+>   $env:MINDLOOM_CONFIG = "$env:TEMP\ml-trial-config.json"
+>   $env:MINDLOOM_ANTIGRAVITY_BRAIN_DIR = "$env:TEMP\mock-agy-brain"
+>   node cli/mem.mjs setup --vault "$env:TEMP\TrialVault" --data "$env:TEMP\TrialVault-Data" --yes
+>   ```
 
 随后在 **Obsidian** 中打开该 Vault 目录即可使用；伴侣插件已安全合并至 `.obsidian/community-plugins.json`，绝不覆盖您原有的其他插件。
 
@@ -105,7 +114,7 @@ node cli/mem.mjs backup --target /path/to/backups   # WAL 检查点一致备份
 
 ## 常见排障
 
-- **提示 `Node >= 22` 或 `node:sqlite` 不可用**：请升级至 Node.js v22 LTS 或 v24+。
+- **提示 `Node >= 22.15.0` 或 `node:sqlite` / Zstd 不可用**：请升级至 Node.js v22.15.0+ LTS 或 v24+ LTS（v23 需 >= 23.8.0）。
 - **提示 `ERR_VAULT_DATA_NESTED`**：`Vault` 与 `Data` 必须为同级分离目录（如 `MindLoom` 与 `MindLoom-Data`），禁止相互嵌套。
 - **返回 `ACCESS_DENIED (EXIT 43)`**：安全门禁设计如此——所有授权签发命令（`setup --authorize-autosync`、`approve-ingest-human.ps1`、`approve-human.ps1`）禁止在 AI Agent 或非交互终端运行，请您在个人终端亲自执行。
 - **插件状态栏提示 `CLI offline`**：打开 **设置 -> MindLoom** 检查 Data 目录与 Node 路径，点击 **Run mem doctor** 验证。

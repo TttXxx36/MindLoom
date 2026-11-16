@@ -83,54 +83,51 @@ function parseFrontmatter(content) {
  * 构建 Vault 内证据链来源工具映射表 (10_Readable_Sessions + 20_Evidence_Cards)
  * 使 30_Knowledge_Notes 无需冗余手填 source_tool 即可通过 sources 链精确推导 derived_source_tools (§3.1, §5.1)
  */
-function buildSourceToolDerivationIndex(vaultDir, db = null) {
+function parseProposalFrontmatterForQueue(content) {
+  return parseProposalContent(content);
+}
+
+/**
+ * 单次安全扫描构建检索上下文（合并四目录读取、YAML 解析、提案映射、ID 计数与来源链接索引）
+ * - 严格保留符号链接拦截与 boundaryDir 越界防护
+ * - 预先一次性读取 SQLite notes / session_snapshots，避免热循环内重复 prepare/get
+ * - 事件块锚点 (^event-NNNNNN) 采用按需懒解析并缓存，仅对最终进入结果集的来源触发读取
+ */
+function collectVaultSearchContext(vaultDir, db = null) {
+  const notesDir = path.join(vaultDir, '30_Knowledge_Notes');
+  const queueDir = path.join(vaultDir, '40_Review_Queue');
+
   const sessionToolByKey = new Map();
   const evidenceSourcesByKey = new Map();
   const evidenceDirectToolByKey = new Map();
+  const tokenToFiles = new Map();
+  const tokenToFilesLower = new Map();
+  const fileMetaByRel = new Map();
+  const proposalsByTargetId = new Map();
+  const managedIdCounts = new Map();
+  const knowledgeDocs = [];
+  const fileRawCache = new Map();
 
-  const registerKeys = (map, filePath, fmId, value) => {
-    const baseNoExt = path.basename(filePath, '.md');
-    const baseWithExt = path.basename(filePath);
-    map.set(baseNoExt, value);
-    map.set(baseWithExt, value);
-    if (fmId) map.set(fmId, value);
+  const dbNoteById = new Map();
+  const dbNoteByPath = new Map();
+  const normFsPath = (p) => {
+    const r = path.resolve(String(p || ''));
+    return process.platform === 'win32' ? r.toLowerCase() : r;
   };
-
-  const sessionSanitizedByKey = new Map();
-  const sessionAllByKey = new Map();
-  const evidenceSanitizedSourcesByKey = new Map();
-
-  const isDbNoteSanitizedActive = (fmId) => {
-    if (!db || !fmId) return true;
-    try {
-      const r = db.prepare('SELECT status, privacy FROM notes WHERE id = ?').get(fmId);
-      if (!r) return true;
-      return r.status !== 'missing' && r.status !== 'deleted' && (!r.privacy || r.privacy === 'sanitized');
-    } catch {
-      return false;
-    }
-  };
-
-  const sessionsDir = path.join(vaultDir, '10_Readable_Sessions');
-  for (const fp of findMarkdownFiles(sessionsDir, { excludeTemplates: true, followSymlinks: false, boundaryDir: vaultDir })) {
-    try {
-      const { frontmatter } = parseFrontmatter(fs.readFileSync(fp, 'utf8'));
-      registerKeys(sessionAllByKey, fp, frontmatter.id, true);
-      if (frontmatter.source_tool) {
-        registerKeys(sessionToolByKey, fp, frontmatter.id, String(frontmatter.source_tool).toLowerCase());
-      }
-      if (frontmatter.privacy === 'sanitized' && isDbNoteSanitizedActive(frontmatter.id)) {
-        registerKeys(sessionSanitizedByKey, fp, frontmatter.id, true);
-      }
-    } catch {
-      // ignore
-    }
-  }
 
   if (db) {
     try {
-      const rows = db.prepare('SELECT session_id, source_tool, readable_session_path FROM session_snapshots').all();
-      for (const r of rows) {
+      const noteRows = db.prepare('SELECT id, status, privacy, path FROM notes').all();
+      for (const r of noteRows) {
+        if (r.id) dbNoteById.set(r.id, r);
+        if (r.path) dbNoteByPath.set(normFsPath(r.path), r);
+      }
+    } catch {
+      // ignore if notes table missing in unit mock
+    }
+    try {
+      const snapRows = db.prepare('SELECT session_id, source_tool, readable_session_path FROM session_snapshots').all();
+      for (const r of snapRows) {
         if (r.source_tool) {
           const tool = String(r.source_tool).toLowerCase();
           if (r.session_id) sessionToolByKey.set(r.session_id, tool);
@@ -145,19 +142,94 @@ function buildSourceToolDerivationIndex(vaultDir, db = null) {
     }
   }
 
-  const evidenceDir = path.join(vaultDir, '20_Evidence_Cards');
-  for (const fp of findMarkdownFiles(evidenceDir, { excludeTemplates: true, followSymlinks: false, boundaryDir: vaultDir })) {
-    try {
-      const { frontmatter } = parseFrontmatter(fs.readFileSync(fp, 'utf8'));
-      registerKeys(evidenceSourcesByKey, fp, frontmatter.id, frontmatter.sources || []);
-      if (frontmatter.privacy === 'sanitized' && isDbNoteSanitizedActive(frontmatter.id)) {
-        registerKeys(evidenceSanitizedSourcesByKey, fp, frontmatter.id, frontmatter.sources || []);
+  const registerKeys = (map, filePath, fmId, value) => {
+    const baseNoExt = path.basename(filePath, '.md');
+    const baseWithExt = path.basename(filePath);
+    map.set(baseNoExt, value);
+    map.set(baseWithExt, value);
+    if (fmId) map.set(fmId, value);
+  };
+
+  const addLookupToken = (tok, relPath) => {
+    if (!tok) return;
+    if (!tokenToFiles.has(tok)) tokenToFiles.set(tok, new Set());
+    tokenToFiles.get(tok).add(relPath);
+    const low = tok.toLowerCase();
+    if (!tokenToFilesLower.has(low)) tokenToFilesLower.set(low, new Set());
+    tokenToFilesLower.get(low).add(relPath);
+  };
+
+  const isDbNoteSanitizedActive = (fmId, filePath) => {
+    if (!db) return true;
+    const r = (fmId ? dbNoteById.get(fmId) : null) || (filePath ? dbNoteByPath.get(normFsPath(filePath)) : null);
+    if (!r) return true;
+    return r.status !== 'missing' && r.status !== 'deleted' && (!r.privacy || r.privacy === 'sanitized');
+  };
+
+  const indexGroups = ['10_Readable_Sessions', '20_Evidence_Cards', '30_Knowledge_Notes', '40_Review_Queue'];
+  for (const dirGroup of indexGroups) {
+    const groupDir = path.join(vaultDir, dirGroup);
+    for (const fp of findMarkdownFiles(groupDir, { excludeTemplates: true, followSymlinks: false, boundaryDir: vaultDir })) {
+      try {
+        const raw = fs.readFileSync(fp, 'utf8');
+        const resolvedFp = path.resolve(fp);
+        fileRawCache.set(resolvedFp, raw);
+
+        let frontmatter;
+        let body = '';
+        if (dirGroup === '40_Review_Queue') {
+          const propParsed = parseProposalFrontmatterForQueue(raw);
+          frontmatter = {
+            ...propParsed.frontmatter,
+            sources: Array.isArray(propParsed.frontmatter?.sources) ? propParsed.frontmatter.sources : []
+          };
+          if (frontmatter.target_id) {
+            if (!proposalsByTargetId.has(frontmatter.target_id)) {
+              proposalsByTargetId.set(frontmatter.target_id, []);
+            }
+            proposalsByTargetId.get(frontmatter.target_id).push({
+              propPath: fp,
+              frontmatter
+            });
+          }
+        } else {
+          const parsed = parseFrontmatter(raw);
+          frontmatter = parsed.frontmatter;
+          body = parsed.body;
+        }
+
+        if (frontmatter && frontmatter.id) {
+          managedIdCounts.set(frontmatter.id, (managedIdCounts.get(frontmatter.id) || 0) + 1);
+        }
+
+        const relPath = path.relative(vaultDir, fp).replace(/\\/g, '/');
+        const relNoExt = relPath.endsWith('.md') ? relPath.slice(0, -3) : relPath;
+        const baseWithExt = path.basename(fp);
+        const baseNoExt = path.basename(fp, '.md');
+        const prefixMatch = baseNoExt.match(/^((?:SES|EV|KN|PROP)-[0-9a-fA-F-]+)/);
+
+        for (const tok of [relPath, relNoExt, baseWithExt, baseNoExt, frontmatter.id, prefixMatch?.[1]]) {
+          addLookupToken(tok, relPath);
+        }
+
+        const allowed = frontmatter.privacy === 'sanitized' && isDbNoteSanitizedActive(frontmatter.id, fp);
+        fileMetaByRel.set(relPath, { relPath, filePath: fp, dirGroup, frontmatter, allowed });
+
+        if (dirGroup === '10_Readable_Sessions') {
+          if (frontmatter.source_tool) {
+            registerKeys(sessionToolByKey, fp, frontmatter.id, String(frontmatter.source_tool).toLowerCase());
+          }
+        } else if (dirGroup === '20_Evidence_Cards') {
+          registerKeys(evidenceSourcesByKey, fp, frontmatter.id, frontmatter.sources || []);
+          if (frontmatter.source_tool) {
+            registerKeys(evidenceDirectToolByKey, fp, frontmatter.id, String(frontmatter.source_tool).toLowerCase());
+          }
+        } else if (dirGroup === '30_Knowledge_Notes') {
+          knowledgeDocs.push({ filePath: fp, raw, frontmatter, body });
+        }
+      } catch {
+        // ignore unreadable/unparseable markdown
       }
-      if (frontmatter.source_tool) {
-        registerKeys(evidenceDirectToolByKey, fp, frontmatter.id, String(frontmatter.source_tool).toLowerCase());
-      }
-    } catch {
-      // ignore
     }
   }
 
@@ -166,20 +238,133 @@ function buildSourceToolDerivationIndex(vaultDir, db = null) {
     if (!clean) return [];
     const base = path.basename(clean);
     const noExt = base.endsWith('.md') ? base.slice(0, -3) : base;
-    const prefixMatch = noExt.match(/^((?:SES|EV)-[0-9a-fA-F-]+)/);
+    const prefixMatch = noExt.match(/^((?:SES|EV|KN|PROP)-[0-9a-fA-F-]+)/);
     return [clean, base, noExt, ...(prefixMatch ? [prefixMatch[1]] : [])];
   }
 
-  function formatCleanAnchorLink(rawLink) {
-    const clean = String(rawLink || '').replace(/^\[\[/, '').replace(/\]\]$/, '').split('|')[0].trim();
-    if (!/#\^event-\d+/i.test(clean)) return null;
-    const targetTokens = extractTargetTokensFromWikiLink(clean);
-    const knownSession = targetTokens.some(tok => sessionSanitizedByKey.has(tok));
-    if (sessionAllByKey.size > 0 && !knownSession) return null;
-    return sanitizeOutputText(clean);
+  function lookupUniqueVaultFile(targetPart) {
+    const cleanTarget = String(targetPart || '').replace(/\\/g, '/').replace(/^\.\//, '').trim();
+    if (!cleanTarget || cleanTarget.startsWith('/') || /^[A-Za-z]:/.test(cleanTarget)) {
+      return null;
+    }
+    if (cleanTarget.split('/').includes('..')) {
+      return null;
+    }
+
+    const candidates = [cleanTarget];
+    if (cleanTarget.endsWith('.md')) candidates.push(cleanTarget.slice(0, -3));
+    else candidates.push(`${cleanTarget}.md`);
+
+    const exactMatches = new Set();
+    for (const c of candidates) {
+      const set = tokenToFiles.get(c);
+      if (set) {
+        for (const rel of set) exactMatches.add(rel);
+      }
+    }
+    let matchedSet = exactMatches;
+    if (matchedSet.size === 0 && process.platform === 'win32') {
+      const lowerMatches = new Set();
+      for (const c of candidates) {
+        const set = tokenToFilesLower.get(c.toLowerCase());
+        if (set) {
+          for (const rel of set) lowerMatches.add(rel);
+        }
+      }
+      matchedSet = lowerMatches;
+    }
+
+    if (matchedSet.size !== 1) {
+      return null;
+    }
+    const [resolvedRel] = matchedSet;
+    return fileMetaByRel.get(resolvedRel) || null;
   }
 
-  const deriveForNote = function deriveForNote(frontmatter) {
+  const blockCountCache = new Map();
+  function getEventBlockCounts(meta) {
+    if (!meta) return null;
+    if (blockCountCache.has(meta.relPath)) {
+      return blockCountCache.get(meta.relPath);
+    }
+    const counts = new Map();
+    try {
+      const rawText = fileRawCache.get(path.resolve(meta.filePath)) ?? fs.readFileSync(meta.filePath, 'utf8');
+      const { body } = parseMarkdownFrontmatter(rawText);
+      const lines = String(body || '').split(/\r?\n/);
+      let inFence = false;
+      let fenceChar = '';
+      let openFenceLen = 0;
+      for (const line of lines) {
+        if (!inFence) {
+          const openMatch = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+          if (openMatch) {
+            const char = openMatch[1][0];
+            const info = openMatch[2] || '';
+            if (char === '~' || !info.includes('`')) {
+              inFence = true;
+              fenceChar = char;
+              openFenceLen = openMatch[1].length;
+              continue;
+            }
+          }
+        } else {
+          const closeMatch = line.match(/^ {0,3}(`+|~+)\s*$/);
+          if (closeMatch && closeMatch[1][0] === fenceChar && closeMatch[1].length >= openFenceLen) {
+            inFence = false;
+            fenceChar = '';
+            openFenceLen = 0;
+          }
+          continue;
+        }
+        if (/^\s*>/.test(line)) continue;
+        const anchorMatch = line.trim().match(/^(?:.*\s)?(\^event-\d+)$/i);
+        if (anchorMatch && anchorMatch[1]) {
+          const key = anchorMatch[1].toLowerCase();
+          counts.set(key, (counts.get(key) || 0) + 1);
+        }
+      }
+    } catch {
+      // unreadable file -> keep empty map
+    }
+    blockCountCache.set(meta.relPath, counts);
+    return counts;
+  }
+
+  function resolveVerifiedVaultLink(rawLink) {
+    const stripped = String(rawLink || '').replace(/^\[\[/, '').replace(/\]\]$/, '').split('|')[0].trim();
+    if (!stripped) return null;
+    const hashIdx = stripped.indexOf('#');
+    const targetPart = (hashIdx === -1 ? stripped : stripped.slice(0, hashIdx)).trim();
+    const subpathPart = (hashIdx === -1 ? '' : stripped.slice(hashIdx + 1)).trim();
+    if (!targetPart) return null;
+
+    const meta = lookupUniqueVaultFile(targetPart);
+    if (!meta || !meta.allowed) return null;
+
+    if (subpathPart) {
+      if (!/^\^event-\d+$/i.test(subpathPart)) {
+        return null;
+      }
+      const blockCounts = getEventBlockCounts(meta);
+      if (!blockCounts || blockCounts.get(subpathPart.toLowerCase()) !== 1) {
+        return null;
+      }
+      return {
+        link: sanitizeOutputText(`${meta.relPath}#${subpathPart}`),
+        isEventAnchor: true,
+        meta
+      };
+    }
+
+    return {
+      link: sanitizeOutputText(meta.relPath),
+      isEventAnchor: false,
+      meta
+    };
+  }
+
+  const deriveSourceToolsForNote = function deriveSourceToolsForNote(frontmatter) {
     const tools = new Set();
     if (frontmatter.source_tool) {
       tools.add(String(frontmatter.source_tool).toLowerCase());
@@ -213,25 +398,48 @@ function buildSourceToolDerivationIndex(vaultDir, db = null) {
     return [...tools];
   };
 
-  deriveForNote.deriveEventAnchors = function deriveEventAnchors(frontmatter) {
-    const anchors = new Set();
+  deriveSourceToolsForNote.deriveOpenableLinks = function deriveOpenableLinks(frontmatter) {
+    const eventAnchors = new Set();
+    const openableLinks = new Set();
     for (const srcLink of frontmatter.sources || []) {
-      const directAnchor = formatCleanAnchorLink(srcLink);
-      if (directAnchor) anchors.add(directAnchor);
-      const tokens = extractTargetTokensFromWikiLink(srcLink);
-      for (const tok of tokens) {
-        if (evidenceSanitizedSourcesByKey.has(tok)) {
-          for (const evLink of evidenceSanitizedSourcesByKey.get(tok) || []) {
-            const evAnchor = formatCleanAnchorLink(evLink);
-            if (evAnchor) anchors.add(evAnchor);
+      const direct = resolveVerifiedVaultLink(srcLink);
+      if (!direct) continue;
+      openableLinks.add(direct.link);
+      if (direct.isEventAnchor) {
+        eventAnchors.add(direct.link);
+      }
+      if (direct.meta.dirGroup === '20_Evidence_Cards') {
+        for (const evLink of direct.meta.frontmatter.sources || []) {
+          const indirect = resolveVerifiedVaultLink(evLink);
+          if (!indirect) continue;
+          openableLinks.add(indirect.link);
+          if (indirect.isEventAnchor) {
+            eventAnchors.add(indirect.link);
           }
         }
       }
     }
-    return [...anchors];
+    return {
+      eventAnchors: [...eventAnchors],
+      openableLinks: [...openableLinks]
+    };
   };
 
-  return deriveForNote;
+  deriveSourceToolsForNote.deriveEventAnchors = function deriveEventAnchors(frontmatter) {
+    return deriveSourceToolsForNote.deriveOpenableLinks(frontmatter).eventAnchors;
+  };
+
+  return {
+    notesDir,
+    queueDir,
+    proposalsByTargetId,
+    managedIdCounts,
+    knowledgeDocs,
+    fileRawCache,
+    dbNoteById,
+    dbNoteByPath,
+    deriveSourceToolsForNote
+  };
 }
 
 /**
@@ -372,57 +580,6 @@ function sameFsPath(a, b) {
   const ra = path.resolve(a);
   const rb = path.resolve(b);
   return process.platform === 'win32' ? ra.toLowerCase() === rb.toLowerCase() : ra === rb;
-}
-
-function collectQueueAndManagedIdContext(vaultDir) {
-  const notesDir = path.join(vaultDir, '30_Knowledge_Notes');
-  const queueDir = path.join(vaultDir, '40_Review_Queue');
-
-  const proposalFiles = findMarkdownFiles(queueDir, { excludeTemplates: true, followSymlinks: false, boundaryDir: vaultDir });
-  const proposalsByTargetId = new Map();
-
-  for (const propPath of proposalFiles) {
-    try {
-      const content = fs.readFileSync(propPath, 'utf8');
-      const { frontmatter } = parseProposalContent(content);
-      if (frontmatter.target_id) {
-        if (!proposalsByTargetId.has(frontmatter.target_id)) {
-          proposalsByTargetId.set(frontmatter.target_id, []);
-        }
-        proposalsByTargetId.get(frontmatter.target_id).push({
-          propPath,
-          frontmatter
-        });
-      }
-    } catch {
-      // ignore broken proposal files
-    }
-  }
-
-  const managedIdCounts = new Map();
-  const managedDirs = [
-    path.join(vaultDir, '10_Readable_Sessions'),
-    path.join(vaultDir, '20_Evidence_Cards'),
-    notesDir,
-    queueDir
-  ];
-  const fileRawCache = new Map();
-  for (const dirPath of managedDirs) {
-    for (const mf of findMarkdownFiles(dirPath, { excludeTemplates: true, followSymlinks: false, boundaryDir: vaultDir })) {
-      try {
-        const content = fs.readFileSync(mf, 'utf8');
-        fileRawCache.set(path.resolve(mf), content);
-        const { frontmatter: mfFm } = parseFrontmatter(content);
-        if (mfFm && mfFm.id) {
-          managedIdCounts.set(mfFm.id, (managedIdCounts.get(mfFm.id) || 0) + 1);
-        }
-      } catch {
-        // ignore unreadable files during ID uniqueness pre-scan
-      }
-    }
-  }
-
-  return { notesDir, queueDir, proposalsByTargetId, managedIdCounts, fileRawCache };
 }
 
 function evaluateNoteChannelAndSafety({
@@ -570,9 +727,7 @@ export function searchKnowledge({
   const notesDir = path.join(vaultDir, '30_Knowledge_Notes');
   const queueDir = path.join(vaultDir, '40_Review_Queue');
 
-  const files = findMarkdownFiles(notesDir, { excludeTemplates: true, followSymlinks: false, boundaryDir: vaultDir });
   const matched = [];
-  const deriveSourceToolsForNote = buildSourceToolDerivationIndex(vaultDir, db);
   const normalizedSourceFilter = sourceTool && String(sourceTool).toLowerCase() !== 'all'
     ? String(sourceTool).trim().toLowerCase()
     : null;
@@ -632,30 +787,27 @@ export function searchKnowledge({
     }
   }
 
-  // 1. 读取 40_Review_Queue 下的所有提案与四目录 ID 计数
-  const { proposalsByTargetId, managedIdCounts, fileRawCache } = collectQueueAndManagedIdContext(vaultDir);
+  // 1. 单次安全扫描全库上下文（同时构建提案映射、ID 计数、DB 状态映射与来源链接索引）
+  const {
+    proposalsByTargetId,
+    managedIdCounts,
+    knowledgeDocs,
+    dbNoteById,
+    deriveSourceToolsForNote
+  } = collectVaultSearchContext(vaultDir, db);
   const effectiveTodayStr = todayStr || getBeijingTodayStr();
 
-  for (const filePath of files) {
-    // 全局排除模板
-    if (filePath.replace(/\\/g, '/').includes('90_Templates/')) {
-      continue;
-    }
-
-    const raw = fileRawCache.get(path.resolve(filePath)) ?? fs.readFileSync(filePath, 'utf8');
-    const rawSha256 = crypto.createHash('sha256').update(raw, 'utf8').digest('hex');
-    const { frontmatter, body } = parseFrontmatter(raw);
-
+  for (const { filePath, raw, frontmatter, body } of knowledgeDocs) {
     // Exit B 铁律 (§3.2): 仅允许 privacy === 'sanitized' 进入任何返回通道；local_only / 缺失 / 非法一律剥离
     if (frontmatter.privacy !== 'sanitized') {
       continue;
     }
 
-    // 检查 SQLite notes 表状态与真实隐私登记 (防止通过篡改 YAML privacy 绕过 Exit B；missing/deleted 暂停召回)
+    // 检查 SQLite notes 表状态与真实隐私登记 (O(1) 内存映射查表，防止通过篡改 YAML privacy 绕过 Exit B)
     let noteRow = null;
     if (db) {
       if (frontmatter.id) {
-        noteRow = db.prepare('SELECT status, privacy, path FROM notes WHERE id = ?').get(frontmatter.id) || null;
+        noteRow = dbNoteById.get(frontmatter.id) || null;
       }
       if (noteRow && (noteRow.status === 'missing' || noteRow.status === 'deleted' || (noteRow.privacy && noteRow.privacy !== 'sanitized'))) {
         continue;
@@ -696,6 +848,9 @@ export function searchKnowledge({
     let hybridScore = 0;
     if (activeMode === 'hybrid' || activeMode === 'rerank') {
       const cachedEntry = frontmatter.id ? indexDocsById.get(frontmatter.id) : null;
+      const rawSha256 = cachedEntry?.docSha256
+        ? crypto.createHash('sha256').update(raw, 'utf8').digest('hex')
+        : null;
       const useCachedTokens = Boolean(
         cachedEntry &&
         cachedEntry.docSha256 &&
@@ -749,7 +904,7 @@ export function searchKnowledge({
       lifecycle: frontmatter.lifecycle,
       review_state: frontmatter.review_state,
       sources: (frontmatter.sources || []).map(s => sanitizeOutputText(s)),
-      event_anchors: deriveSourceToolsForNote.deriveEventAnchors(frontmatter),
+      _frontmatter: frontmatter,
       snippet: safeSnippet,
       score: Number(totalScore.toFixed(4)),
       trustBoundary: 'untrusted_memory_data',
@@ -841,7 +996,14 @@ export function searchKnowledge({
     }
   }
 
-  const sliced = matched.slice(0, topK);
+  const sliced = matched.slice(0, topK).map(({ _frontmatter, ...item }) => {
+    const { eventAnchors, openableLinks } = deriveSourceToolsForNote.deriveOpenableLinks(_frontmatter);
+    return {
+      ...item,
+      event_anchors: eventAnchors,
+      openable_links: openableLinks
+    };
+  });
 
   return {
     mode: activeMode,
@@ -905,6 +1067,10 @@ function buildActionableStatusForFile({
     queryTerms
   });
 
+  const derivedLinks = deriveSourceToolsForNote?.deriveOpenableLinks
+    ? deriveSourceToolsForNote.deriveOpenableLinks(fm)
+    : { eventAnchors: [], openableLinks: [] };
+
   return {
     id: fm.id || null,
     title: evaluated.safeTitle || sanitizeOutputText(path.basename(filePath, '.md')),
@@ -916,6 +1082,8 @@ function buildActionableStatusForFile({
     lifecycle: fm.lifecycle || null,
     review_state: fm.review_state || null,
     sources: (fm.sources || []).map((s) => sanitizeOutputText(s)),
+    event_anchors: derivedLinks.eventAnchors,
+    openable_links: derivedLinks.openableLinks,
     snippet: evaluated.safeSnippet,
     trustBoundary: 'untrusted_memory_data',
     injectionDetected: evaluated.injectionDetected
@@ -1357,9 +1525,12 @@ export async function searchKnowledgeAsync({
     });
   }
 
-  const { proposalsByTargetId, managedIdCounts } = collectQueueAndManagedIdContext(vaultDir);
+  const {
+    proposalsByTargetId,
+    managedIdCounts,
+    deriveSourceToolsForNote
+  } = collectVaultSearchContext(vaultDir, db);
   const queryTerms = String(query || '').trim().toLowerCase().split(/\s+/).filter(Boolean);
-  const deriveSourceToolsForNote = buildSourceToolDerivationIndex(vaultDir, db);
   for (const hit of vectorHitsRes.items) {
     const existing = mergedById.get(hit.docId);
     if (existing) {
@@ -1534,9 +1705,14 @@ export async function rerankFrozenCandidatesAsync({
     };
   }
 
-  // Scan Vault fresh and re-evaluate every frozen candidate from live DB + Markdown
-  const { notesDir, proposalsByTargetId, managedIdCounts, fileRawCache } = collectQueueAndManagedIdContext(vaultDir);
-  const deriveSourceToolsForNote = buildSourceToolDerivationIndex(vaultDir, db);
+  // Scan Vault fresh once and re-evaluate every frozen candidate from live DB + Markdown
+  const {
+    notesDir,
+    proposalsByTargetId,
+    managedIdCounts,
+    fileRawCache,
+    deriveSourceToolsForNote
+  } = collectVaultSearchContext(vaultDir, db);
   const queryTerms = String(query || '').trim().toLowerCase().split(/\s+/).filter(Boolean);
   const noteFilesById = new Map();
   const noteFilesByRelPath = new Map();

@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { openDatabase } from './db/sqlite.mjs';
-import { ensureInstanceIdentity } from './storage/instance-identity.mjs';
+import { assertVaultDataIsolation, ensureInstanceIdentity } from './storage/instance-identity.mjs';
 import { getDefaultVaultPath, getDefaultDataPath } from './config/paths.mjs';
 
 export const DEFAULT_VAULT_PATH = getDefaultVaultPath();
@@ -325,6 +325,7 @@ function dirHasAnyFiles(dir, extensionFilter = null) {
 export function initRepository(options = {}) {
   const vaultPath = options.vaultPath || DEFAULT_VAULT_PATH;
   const dataPath = options.dataPath || DEFAULT_DATA_PATH;
+  assertVaultDataIsolation({ vaultPath, dataPath });
   const dbPath = path.join(dataPath, 'runtime', 'state.sqlite');
 
   // §2 铁律：若 Vault/Data 已存持久化内容但 state.sqlite 缺失，严禁静默初始化为空库

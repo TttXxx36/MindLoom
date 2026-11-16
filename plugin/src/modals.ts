@@ -31,6 +31,11 @@ export class QuickSearchModal extends Modal {
   onOpen(): void {
     const { contentEl } = this;
     contentEl.empty();
+    this.items = [];
+    this.selectedIdx = 0;
+    this.lastSearchedQuery = '';
+    this.lastSearchedProject = '';
+    this.lastSearchedSource = 'all';
     contentEl.createEl('h3', { text: 'MindLoom Quick Search (Mode 0 · Zero Egress)' });
 
     const controls = contentEl.createDiv({ cls: 'mindloom-actions' });
@@ -92,7 +97,7 @@ export class QuickSearchModal extends Modal {
     const openSelected = (preferAnchor: boolean) => {
       const item = this.items[this.selectedIdx];
       if (!item) return;
-      const anchors = extractEventWikilinks([...(item.event_anchors || []), ...(item.sources || [])]);
+      const anchors = extractEventWikilinks(item.event_anchors || []);
       this.close();
       void this.openTarget(item.path, preferAnchor && anchors.length > 0 ? anchors[0] : undefined);
     };
@@ -164,8 +169,11 @@ export class QuickSearchModal extends Modal {
         row.createDiv({ cls: 'mindloom-muted', text: item.snippet });
       }
 
-      const anchors = extractEventWikilinks([...(item.event_anchors || []), ...(item.sources || [])]);
-      if (anchors.length > 0 || (item.sources && item.sources.length > 0)) {
+      const anchors = extractEventWikilinks(item.event_anchors || []);
+      const verifiedLinks = (item.openable_links || [])
+        .map((rawLink) => formatWikilinkTarget(rawLink))
+        .filter((cleanTarget) => Boolean(cleanTarget) && !/#\^event-\d+/i.test(cleanTarget));
+      if (anchors.length > 0 || verifiedLinks.length > 0) {
         const srcRow = row.createDiv({ cls: 'mindloom-actions' });
         srcRow.style.marginTop = '4px';
         for (const anchorTarget of anchors.slice(0, 3)) {
@@ -177,10 +185,8 @@ export class QuickSearchModal extends Modal {
             void this.openTarget(item.path, anchorTarget);
           });
         }
-        if (anchors.length === 0 && item.sources) {
-          for (const rawSrc of item.sources.slice(0, 2)) {
-            const cleanTarget = formatWikilinkTarget(rawSrc);
-            if (!cleanTarget) continue;
+        if (anchors.length === 0) {
+          for (const cleanTarget of verifiedLinks.slice(0, 2)) {
             const btn = srcRow.createEl('button', {
               text: `Open ${path.basename(cleanTarget)}`
             });

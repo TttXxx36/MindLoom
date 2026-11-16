@@ -40,7 +40,7 @@
 ## 1-Minute QuickStart
 
 ### Prerequisites
-- **Node.js >= 22** (required for built-in `node:sqlite` and `node:zlib` Zstd)
+- **Node.js 22 LTS (`>= 22.15.0`) or Node.js 24+ LTS** (required for built-in `node:sqlite` and `node:zlib` Zstd added in 22.15.0; non-LTS 23.x requires `>= 23.8.0`)
 - **Git**
 - **Obsidian Desktop** (optional for GUI console & Bases views)
 
@@ -69,11 +69,18 @@ Or use the platform wrapper scripts:
   bash ./scripts/install.sh --authorize-autosync
   ```
 
-### Option B: Custom Vault / Data Paths
+### Option B: Custom Vault / Data Paths & Isolated Trial
 
 ```bash
 node cli/mem.mjs setup --vault "/path/to/MyVault" --data "/path/to/MyVault-Data" --yes
 ```
+
+> **Note on first-time setup & isolated trials:**
+> - **Empty Vault required for initial setup:** First-time `setup` / `init` only initializes an empty Vault + Data pair. Pairing an existing non-empty Obsidian Vault with a new Data directory is rejected with `INIT_ALREADY_INITIALIZED` to protect existing user files.
+> - **Config isolation for trials:** `--vault` and `--data` change the target directories, while `setup` still writes the default user config (`~/.mindloom/config.json`). To run an isolated trial without modifying your default config or reading real session roots, set `MINDLOOM_CONFIG` (and optionally `MINDLOOM_CODEX_HOME`, `MINDLOOM_ANTIGRAVITY_BRAIN_DIR`, `MINDLOOM_DSH_HOME`) in that shell:
+>   ```bash
+>   MINDLOOM_CONFIG=/tmp/ml-trial-config.json MINDLOOM_CODEX_HOME=/tmp/mock-codex node cli/mem.mjs setup --vault "/tmp/TrialVault" --data "/tmp/TrialVault-Data" --yes
+>   ```
 
 Then open the Vault folder in **Obsidian Desktop** and enable community plugins if prompted — `mindloom` is already installed and pre-registered in `.obsidian/community-plugins.json` without overwriting any of your existing plugins.
 
@@ -111,7 +118,7 @@ node cli/mem.mjs backup --target /path/to/backups   # Consistent WAL-checkpointe
 
 ## Troubleshooting
 
-- **`Node >= 22` / `node:sqlite` error**: Upgrade Node.js to v22 LTS or v24+.
+- **`Node >= 22.15.0` / `node:sqlite` / Zstd error**: Upgrade Node.js to v22.15.0+ LTS or v24+ LTS (non-LTS v23 requires >= 23.8.0).
 - **`ERR_VAULT_DATA_NESTED`**: `Vault` and `Data` directories must be separate siblings (e.g., `MindLoom` and `MindLoom-Data`), never nested inside each other.
 - **`ACCESS_DENIED (EXIT 43)`**: Human approval commands (`setup --authorize-autosync`, `approve-ingest-human.ps1`, `approve-human.ps1`) intentionally reject AI agent shells (`ANTIGRAVITY_AGENT`, `CODEX_SANDBOX`, `CI`, non-TTY). Run them directly in your own terminal.
 - **Plugin says `CLI offline`**: Open **Settings -> MindLoom** and verify **Data Directory Path**, **Node.js Executable**, and click **Run mem doctor**.
